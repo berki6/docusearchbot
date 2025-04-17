@@ -1,5 +1,3 @@
-# Import necessary libraries and modules
-# These include libraries for Telegram bot functionality, HTTP requests, and arXiv API interaction
 import os
 import sys
 import time
@@ -9,10 +7,16 @@ import asyncio
 import requests
 import arxiv
 import urllib3
+import re
+import sqlite3
 from datetime import datetime, timedelta
+from typing import Dict, List
+from collections import defaultdict
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from pytz import utc
+from langdetect import detect
+from telegram.error import TelegramError
 
 import telegram
 from telegram import (
@@ -33,157 +37,217 @@ from telegram.ext import (
     JobQueue,
 )
 
-# Set up logging for debugging and monitoring bot activity
-# This helps track bot operations and errors in real-time
+# Set up logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOTAPI")
-# Remove hardcoded token for security
+if not BOT_TOKEN:
+    raise ValueError("BOTAPI environment variable not set")
+
+# Rate limiting configuration
+RATE_LIMIT_REQUESTS = 5  # Max requests per minute
+RATE_LIMIT_WINDOW = 60  # Seconds
+user_request_counts: Dict[int, List[float]] = defaultdict(list)
+
+# Localization dictionaries
+LOCALES = {
+    "en": {
+        "welcome": "📚 Welcome to Research Paper Bot! Choose an option:",
+        "search_prompt": "Please enter your search keywords (e.g., deep learning):",
+        "searching": "🔍 Searching for papers... Please wait.",
+        "no_papers": "No papers found. Please try a different search term.",
+        "error": "Sorry, an error occurred. Please try again.",
+        "rate_limit": "Too many requests. Please wait a minute and try again.",
+        "help": "Use the 🔍 Search button or type a topic directly to find academic papers from arXiv.",
+        "results_found": "📚 Found {count} papers matching your search.",
+        "no_more_papers": "No more papers available for this search.",
+        "timeout_message": '⏱️ It\'s been a while since you checked the "Load More" results. You can either click the "Load More" button to continue viewing results, or start a new search using the 🔍 Search button.',
+        "session_expired": "Your search session has expired. Please start a new search.",
+    },
+    "es": {
+        "welcome": "📚 ¡Bienvenido al Bot de Artículos de Investigación! Elige una opción:",
+        "search_prompt": "Por favor, ingresa tus palabras clave de búsqueda (por ejemplo, aprendizaje profundo):",
+        "searching": "🔍 Buscando artículos... Por favor espera.",
+        "no_papers": "No se encontraron artículos. Prueba con un término diferente.",
+        "error": "Lo siento, ocurrió un error. Por favor intenta de nuevo.",
+        "rate_limit": "Demasiadas solicitudes. Por favor espera un minuto e intenta de nuevo.",
+        "help": "Usa el botón 🔍 Buscar o escribe un tema directamente para encontrar artículos académicos de arXiv.",
+        "results_found": "📚 Encontrados {count} artículos que coinciden con tu búsqueda.",
+        "no_more_papers": "No hay más artículos disponibles para esta búsqueda.",
+        "timeout_message": '⏱️ Ha pasado un tiempo desde que revisaste los resultados de "Cargar Más". Puedes hacer clic en el botón "Cargar Más" para continuar viendo resultados, o iniciar una nueva búsqueda usando el botón 🔍 Buscar.',
+        "session_expired": "Tu sesión de búsqueda ha expirado. Por favor inicia una nueva búsqueda.",
+    },
+}
 
 
-# Define a class to track user state, including search queries, pagination, and timeout handling
+# SQLite Database Setup
+def init_db():
+    conn = sqlite3.connect("user_states.db")
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS user_states
+                 (user_id INTEGER PRIMARY KEY,
+                  state TEXT,
+                  query TEXT,
+                  current_page INTEGER,
+                  load_more_timestamp TEXT,
+                  load_more_message_id INTEGER,
+                  last_search_time TEXT)"""
+    )
+    conn.commit()
+    conn.close()
+
+
+# Initialize database
+init_db()
+
+
+# Input sanitization
+def sanitize_input(text: str) -> str:
+    """Sanitize user input to prevent injection attacks"""
+    text = re.sub(r"[<>;{}]", "", text.strip())
+    return text[:500]
+
+
+# Rate limiting check
+def check_rate_limit(user_id: int) -> bool:
+    """Check if user has exceeded rate limit"""
+    current_time = time.time()
+    user_request_counts[user_id] = [
+        t for t in user_request_counts[user_id] if current_time - t < RATE_LIMIT_WINDOW
+    ]
+    if len(user_request_counts[user_id]) >= RATE_LIMIT_REQUESTS:
+        return False
+    user_request_counts[user_id].append(current_time)
+    return True
+
+
+# User state management
 class UserState:
-    """Class to track user state including search query, page, and timestamps"""
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.results_per_page = 5
+        self.timeout_job = None
+        self._load_from_db()
 
-    def __init__(self):
-        self.state = None  # Current state (e.g., "awaiting_query")
-        self.query = None  # Last search query entered by the user
-        self.current_page = 0  # Current page in search results for pagination
-        self.results_per_page = 5  # Number of results to display per page
-        self.load_more_timestamp = (
-            None  # Timestamp when the "Load More" button was added
+    def _load_from_db(self):
+        conn = sqlite3.connect("user_states.db")
+        c = conn.cursor()
+        c.execute("SELECT * FROM user_states WHERE user_id = ?", (self.user_id,))
+        data = c.fetchone()
+        conn.close()
+
+        if data:
+            self.state = data[1]
+            self.query = data[2]
+            self.current_page = data[3]
+            self.load_more_timestamp = (
+                datetime.fromisoformat(data[4]) if data[4] else None
+            )
+            self.load_more_message_id = data[5]
+            self.last_search_time = datetime.fromisoformat(data[6]) if data[6] else None
+        else:
+            self.state = None
+            self.query = None
+            self.current_page = 0
+            self.load_more_timestamp = None
+            self.load_more_message_id = None
+            self.last_search_time = None
+
+    def save_to_db(self):
+        conn = sqlite3.connect("user_states.db")
+        c = conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO user_states 
+                    (user_id, state, query, current_page, load_more_timestamp, 
+                     load_more_message_id, last_search_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                self.user_id,
+                self.state,
+                self.query,
+                self.current_page,
+                (
+                    self.load_more_timestamp.isoformat()
+                    if self.load_more_timestamp
+                    else None
+                ),
+                self.load_more_message_id,
+                self.last_search_time.isoformat() if self.last_search_time else None,
+            ),
         )
-        self.load_more_message_id = (
-            None  # ID of the message containing the "Load More" button
-        )
-        self.last_search_time = (
-            None  # Timestamp of the last search performed by the user
-        )
-        self.timeout_job = None  # Job for handling timeout of the "Load More" button
+        conn.commit()
+        conn.close()
 
 
-# Dictionary to store user states for each user interacting with the bot
-# This allows the bot to maintain context for multiple users simultaneously
-user_states = {}
+user_states: Dict[int, UserState] = {}
 
-# Timeout settings for the "Load More" button
+# Timeout settings
 LOAD_MORE_TIMEOUT = 300  # 5 minutes in seconds
 
 
-# Function to search arXiv for academic papers based on a query
 def search_arxiv(query: str, max_results=5):
-    """Search arXiv for academic papers based on the given query."""
-    # This function uses the arXiv API to fetch papers matching the user's query
-    # It includes error handling for network issues and API limitations
     try:
         logger.info(f"Searching arXiv using arxiv package for: {query}")
 
-        # Create a customized session with proper timeout and retry settings
         session = requests.Session()
-
-        # Optional: Configure proxy if needed
-        # proxy_url = "http://your-proxy-server:port"
-        # session.proxies = {
-        #     "http": proxy_url,
-        #     "https": proxy_url
-        # }
-
-        # Configure retry strategy with more conservative exponential backoff
         retry_strategy = Retry(
-            total=2,  # Increased maximum number of retries
-            backoff_factor=2,  # Increased exponential backoff factor
-            status_forcelist=[429, 500, 502, 503, 504],  # HTTP status codes to retry on
-            allowed_methods=["GET"],  # Only retry on GET requests
-            respect_retry_after_header=True,  # Respect Retry-After headers
-            connect=4,  # More retries on connection errors
-            read=4,  # More retries on read errors
+            total=2,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            respect_retry_after_header=True,
+            connect=4,
+            read=4,
         )
-
-        # Configure adapters for both HTTP and HTTPS
         adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=5,  # Reduced connection pool
-            pool_maxsize=5,  # Reduced max pool size to conserve resources
+            max_retries=retry_strategy, pool_connections=5, pool_maxsize=5
         )
-
         session.mount("http://", adapter)
         session.mount("https://", adapter)
-
-        # Set more generous timeouts for connect and read operations
-        session.timeout = (15, 90)  # (connect timeout, read timeout) in seconds
+        session.timeout = (15, 90)
 
         logger.info("Configured session with connect timeout=15s, read timeout=90s")
 
-        # Create a search object with appropriate parameters
         search = arxiv.Search(
             query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance
         )
 
-        # Create a client with more conservative settings
-        client = arxiv.Client(
-            page_size=10,  # Reduced page size to minimize data transfer
-            delay_seconds=5,  # Increased delay between requests
-            num_retries=5,  # Increased number of retries
-        )
-
-        # Replace the default session with our custom one
+        client = arxiv.Client(page_size=10, delay_seconds=5, num_retries=5)
         client._session = session
 
         logger.info("Configured arxiv client with page_size=10, delay=5s, retries=5")
 
         entries = []
+        for result in client.results(search):
+            try:
+                authors = ", ".join(author.name for author in result.authors)[:100]
+                published = result.published.strftime("%Y-%m-%d")
+                categories = ", ".join(result.categories)[:100]
+                title = result.title.strip()
+                link = result.entry_id
+                summary = (
+                    (result.summary.strip()[:500] + "...")
+                    if result.summary
+                    else "No summary available"
+                )
 
-        # Use the client to get results with proper timeout handling
-        try:
-            # Execute the search and process results
-            for result in client.results(search):
-                try:
-                    title = result.title.strip()
-                    link = result.entry_id  # This is the URL to the paper
-
-                    # Process the summary, limiting to 500 chars
-                    if result.summary:
-                        summary = result.summary.strip()[:500] + "..."
-                    else:
-                        summary = "No summary available"
-
-                    entries.append({"title": title, "link": link, "summary": summary})
-                except Exception as e:
-                    logger.error(f"Error processing entry: {e}")
-                    continue
-        except requests.exceptions.ConnectTimeout as e:
-            logger.error(f"Connection timeout error in arxiv client: {e}")
-            return {
-                "error": "connect_timeout",
-                "message": "Could not connect to arXiv server. Please try again later.",
-            }
-        except requests.exceptions.ReadTimeout as e:
-            logger.error(f"Read timeout error in arxiv client: {e}")
-            return {
-                "error": "read_timeout",
-                "message": "The arXiv server took too long to respond. Please try again later.",
-            }
-        except requests.exceptions.Timeout as e:
-            logger.error(f"General timeout error in arxiv client: {e}")
-            return {
-                "error": "timeout",
-                "message": "The request to arXiv timed out. Please try again later.",
-            }
-        except urllib3.exceptions.MaxRetryError as e:
-            logger.error(f"Max retry error in arxiv client: {e}")
-            return {
-                "error": "max_retries",
-                "message": "Maximum retry attempts exceeded when connecting to arXiv. The service might be experiencing issues.",
-            }
-        except urllib3.exceptions.ProtocolError as e:
-            logger.error(f"Protocol error in arxiv client: {e}")
-            return {
-                "error": "protocol_error",
-                "message": "A protocol error occurred when connecting to arXiv. Please try again later.",
-            }
+                entries.append(
+                    {
+                        "title": title,
+                        "link": link,
+                        "summary": summary,
+                        "authors": authors,
+                        "published": published,
+                        "categories": categories,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error processing entry: {e}")
+                continue
 
         return entries
 
@@ -225,105 +289,233 @@ def search_arxiv(query: str, max_results=5):
         }
 
 
-# Helper function to create the main keyboard with "Search" and "Help" buttons
 def get_main_keyboard():
-    """Returns the main keyboard with Search and Help buttons"""
-    # This keyboard provides users with quick access to the main bot features
     keyboard = [[KeyboardButton(text="🔍 Search")], [KeyboardButton(text="📖 Help")]]
     return ReplyKeyboardMarkup(
         keyboard,
-        resize_keyboard=True,  # Make buttons smaller
-        one_time_keyboard=False,  # Keep keyboard visible
+        resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
 
-# Command handler for the /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a welcome message and display the main keyboard."""
-    # This function is triggered when the user sends the /start command
-    # It initializes the bot interaction and displays the main menu
+    user_id = update.message.from_user.id
+    if user_id not in user_states:
+        user_states[user_id] = UserState(user_id)
+
+    try:
+        lang = detect(update.message.text)[:2] if update.message.text else "en"
+        if lang not in LOCALES:
+            lang = "en"
+    except:
+        lang = "en"
+
     reply_markup = get_main_keyboard()
-    await update.message.reply_text(
-        "📚 Welcome to Research Paper Bot! Choose an option:", reply_markup=reply_markup
-    )
+    await update.message.reply_text(LOCALES[lang]["welcome"], reply_markup=reply_markup)
 
 
-# Command handler for the /help command
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Provide instructions on how to use the bot."""
-    # This function provides guidance on using the bot's features
+    user_id = update.message.from_user.id
+    if user_id not in user_states:
+        user_states[user_id] = UserState(user_id)
+
+    try:
+        lang = detect(update.message.text)[:2] if update.message.text else "en"
+        if lang not in LOCALES:
+            lang = "en"
+    except:
+        lang = "en"
+
     await update.message.reply_text(
-        "Use the 🔍 Search button or type a topic directly to find academic papers from arXiv.",
+        LOCALES[lang]["help"],
         reply_markup=get_main_keyboard(),
     )
 
 
-# Handle user interactions with the main keyboard buttons
 async def handle_message_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle interactions with the main keyboard buttons."""
-    # This function processes user input from the main keyboard (e.g., "Search", "Help")
     message_text = update.message.text
     user_id = update.message.from_user.id
 
+    try:
+        lang = detect(message_text)[:2] if message_text else "en"
+        if lang not in LOCALES:
+            lang = "en"
+    except:
+        lang = "en"
+
     if message_text == "🔍 Search":
         if user_id not in user_states:
-            user_states[user_id] = UserState()
+            user_states[user_id] = UserState(user_id)
         user_states[user_id].state = "awaiting_query"
-        # Remove keyboard while waiting for search input
+        user_states[user_id].save_to_db()
         await update.message.reply_text(
-            "Please enter your search keywords (e.g., deep learning):",
+            LOCALES[lang]["search_prompt"],
             reply_markup=ReplyKeyboardRemove(),
         )
-
     elif message_text == "📖 Help":
         await update.message.reply_text(
-            "Type a topic or use the search button to find papers. We'll fetch from arXiv.org.",
+            LOCALES[lang]["help"],
             reply_markup=get_main_keyboard(),
         )
 
 
-# Handle inline button interactions (e.g., "Load More")
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button interactions."""
-    # This function processes user input from inline buttons (e.g., "Load More")
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
+
+    try:
+        lang = "en"  # Default to English for callback queries
+    except:
+        lang = "en"
 
     if data == "action_search":
-        user_id = query.from_user.id
         if user_id not in user_states:
-            user_states[user_id] = UserState()
+            user_states[user_id] = UserState(user_id)
         user_states[user_id].state = "awaiting_query"
+        user_states[user_id].save_to_db()
         await query.message.reply_text(
-            "Please enter your search keywords (e.g., deep learning):",
+            LOCALES[lang]["search_prompt"],
             reply_markup=ReplyKeyboardRemove(),
         )
-
     elif data == "action_help":
         await query.message.reply_text(
-            "Type a topic or use the search button to find papers. We'll fetch from arXiv.org.",
+            LOCALES[lang]["help"],
             reply_markup=get_main_keyboard(),
         )
 
 
-# Handle text messages sent by the user
+async def update_progress_bar(update, context, processing_message, total_results):
+    try:
+        steps = min(total_results, 5)
+        for i in range(0, 101, int(100 / steps)):
+            await asyncio.sleep(0.5)
+            try:
+                if processing_message:
+                    await processing_message.edit_text(
+                        text=f"🔄 Searching... {i}% complete"
+                    )
+            except TelegramError as e:
+                logger.warning(f"Failed to update progress: {e}")
+                break
+    except asyncio.CancelledError:
+        pass
+
+
+async def cleanup_load_more_state(user_id, context):
+    try:
+        if user_id in user_states:
+            user_state = user_states[user_id]
+            if user_state.timeout_job:
+                try:
+                    user_state.timeout_job.schedule_removal()
+                except Exception as e:
+                    logger.warning(f"Error removing scheduled job: {e}")
+                user_state.timeout_job = None
+            user_state.load_more_timestamp = None
+            user_state.load_more_message_id = None
+            user_state.save_to_db()
+            logger.debug(f"Cleaned up Load More state for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error during cleanup of Load More state: {e}")
+        user_states[user_id].load_more_message_id = None
+        user_states[user_id].save_to_db()
+
+
+async def send_load_more_timeout_message(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.data.get("user_id")
+    chat_id = job.data.get("chat_id")
+
+    if user_id in user_states:
+        user_state = user_states[user_id]
+        if (
+            user_state.load_more_timestamp
+            and (datetime.now() - user_state.load_more_timestamp).total_seconds()
+            >= LOAD_MORE_TIMEOUT
+        ):
+            try:
+                if chat_id:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=LOCALES["en"][
+                            "timeout_message"
+                        ],  # Default to English for timeout messages
+                        reply_markup=get_main_keyboard(),
+                    )
+                    user_state.timeout_job = None
+                    user_state.load_more_timestamp = None
+                    user_state.load_more_message_id = None
+                    user_state.save_to_db()
+            except Exception as e:
+                logger.error(f"Error sending timeout message: {e}")
+
+
+async def handle_load_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+
+    try:
+        lang = "en"  # Default to English for callback queries
+    except:
+        lang = "en"
+
+    if (
+        user_id not in user_states
+        or not user_states[user_id].query
+        or not user_states[user_id].load_more_message_id
+        or user_states[user_id].load_more_message_id != message_id
+    ):
+        await query.message.reply_text(
+            LOCALES[lang]["session_expired"], reply_markup=get_main_keyboard()
+        )
+        return
+
+    user_state = user_states[user_id]
+    stored_query = user_state.query
+    user_state.current_page += 1
+    user_state.save_to_db()
+
+    if user_state.timeout_job:
+        user_state.timeout_job.schedule_removal()
+        user_state.timeout_job = None
+
+    processing_message = await query.message.reply_text(LOCALES[lang]["searching"])
+
+    await send_paper_results(
+        update, context, stored_query, processing_message, is_load_more=True, lang=lang
+    )
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process user text input and perform searches or other actions."""
-    # This function handles free-text input from the user, such as search queries
     try:
         user_id = update.message.from_user.id
-        message_text = update.message.text
+        message_text = sanitize_input(update.message.text)
 
-        # Check if this is a button press
+        try:
+            lang = detect(message_text)[:2]
+            if lang not in LOCALES:
+                lang = "en"
+        except:
+            lang = "en"
+
+        if not check_rate_limit(user_id):
+            await update.message.reply_text(
+                LOCALES[lang]["rate_limit"], reply_markup=get_main_keyboard()
+            )
+            return
+
         if message_text in ["🔍 Search", "📖 Help"]:
             return await handle_message_buttons(update, context)
 
-        # Initialize user state if not exists
         if user_id not in user_states:
-            user_states[user_id] = UserState()
+            user_states[user_id] = UserState(user_id)
 
-        # Cancel any existing load more timeout job
         if user_states[user_id].timeout_job:
             user_states[user_id].timeout_job.schedule_removal()
             user_states[user_id].timeout_job = None
@@ -335,193 +527,63 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[user_id].query = query
             user_states[user_id].current_page = 0
             user_states[user_id].last_search_time = datetime.now()
+            user_states[user_id].save_to_db()
 
-            # Perform complete cleanup of any Load More state
             await cleanup_load_more_state(user_id, context)
 
-            # Send a searching message to provide immediate feedback (with keyboard removed)
             processing_message = await update.message.reply_text(
-                "🔍 Searching for papers... Please wait.",
+                LOCALES[lang]["searching"],
                 reply_markup=ReplyKeyboardRemove(),
             )
 
-            await send_paper_results(update, context, query, processing_message)
+            await send_paper_results(
+                update, context, query, processing_message, lang=lang
+            )
         else:
-            # If user just sent text without being in search mode, treat it as a search
             query = message_text
-
-            # Clean up any existing Load More state
             await cleanup_load_more_state(user_id, context)
 
-            # Send a searching message (with keyboard removed)
             processing_message = await update.message.reply_text(
-                "🔍 Searching for papers... Please wait.",
+                LOCALES[lang]["searching"],
                 reply_markup=ReplyKeyboardRemove(),
             )
 
-            await send_paper_results(update, context, query, processing_message)
+            await send_paper_results(
+                update, context, query, processing_message, lang=lang
+            )
     except Exception as e:
         logger.exception(f"Error in handle_text: {e}")
-        # Restore keyboard even on error
+        try:
+            lang = detect(update.message.text)[:2] if update.message.text else "en"
+            if lang not in LOCALES:
+                lang = "en"
+        except:
+            lang = "en"
         await update.message.reply_text(
-            "Sorry, an error occurred while processing your message. Please try again.",
+            LOCALES[lang]["error"],
             reply_markup=get_main_keyboard(),
         )
 
 
-# Update a progress bar message during long-running operations
-async def update_progress_bar(update, context, processing_message):
-    """Simulate a progress bar for long-running operations."""
-    # This function provides visual feedback to the user during lengthy operations
-    try:
-        for progress in range(0, 101, 10):  # Increment progress by 10%
-            await asyncio.sleep(1)  # Simulate progress every second
-            try:
-                if processing_message:
-                    await processing_message.edit_text(
-                        text=f"🔄 Searching... {progress}% complete"
-                    )
-            except telegram.error.BadRequest as e:
-                logger.warning(f"Failed to update progress: {e}")
-                break  # Stop updating if the message is deleted or edited elsewhere
-    except asyncio.CancelledError:
-        pass  # Handle cancellation gracefully
-
-
-# Clean up the "Load More" state for a user
-async def cleanup_load_more_state(user_id, context):
-    """Clean up any existing Load More state for a user."""
-    # This function resets the "Load More" state when a new search is initiated
-    try:
-        if user_id in user_states:
-            user_state = user_states[user_id]
-
-            # Cancel any existing timeout job
-            if user_state.timeout_job:
-                try:
-                    user_state.timeout_job.schedule_removal()
-                except Exception as e:
-                    logger.warning(f"Error removing scheduled job: {e}")
-                user_state.timeout_job = None
-
-            # Reset load more timestamp and message ID
-            user_state.load_more_timestamp = None
-            user_state.load_more_message_id = None
-
-            logger.debug(f"Cleaned up Load More state for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error during cleanup of Load More state: {e}")
-        user_state.load_more_message_id = None
-
-
-# Send a timeout message if the "Load More" button is ignored
-async def send_load_more_timeout_message(context: ContextTypes.DEFAULT_TYPE):
-    """Send a reminder message after timeout for Load More button."""
-    # This function notifies the user if they have not interacted with the "Load More" button
-    job = context.job
-    user_id = job.data.get("user_id")
-    chat_id = job.data.get("chat_id")
-
-    if user_id in user_states:
-        user_state = user_states[user_id]
-
-        # Only send the timeout message if the load more timestamp hasn't changed
-        if (
-            user_state.load_more_timestamp
-            and (datetime.now() - user_state.load_more_timestamp).total_seconds()
-            >= LOAD_MORE_TIMEOUT
-        ):
-
-            try:
-                if chat_id:
-                    # Send informative and actionable timeout message
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text='⏱️ It\'s been a while since you checked the "Load More" results for your search. You can either click the "Load More" button to continue viewing results, or start a new search using the 🔍 Search button.',
-                        reply_markup=get_main_keyboard(),
-                    )
-
-                    # Clear all load more state for this user
-                    user_state.timeout_job = None
-                    user_state.load_more_timestamp = None
-                    user_state.load_more_message_id = None
-
-                    # We don't actually invalidate the query to allow the user
-                    # to restart the same search if they want
-            except Exception as e:
-                logger.error(f"Error sending timeout message: {e}")
-
-
-# Handle the "Load More" button callback
-async def handle_load_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the Load More button callback."""
-    # This function loads additional search results when the user clicks "Load More"
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    message_id = query.message.message_id
-
-    # Check if this is the most recent Load More button and the button is still valid
-    if (
-        user_id not in user_states
-        or not user_states[user_id].query
-        or not user_states[user_id].load_more_message_id
-        or user_states[user_id].load_more_message_id != message_id
-    ):
-        await query.message.reply_text(
-            "Your search session has expired. Please start a new search.",
-            reply_markup=get_main_keyboard(),
-        )
-        return
-
-    # Get the stored search query and increment page
-    user_state = user_states[user_id]
-    stored_query = user_state.query
-    user_state.current_page += 1
-
-    # Cancel any existing timeout job
-    if user_state.timeout_job:
-        user_state.timeout_job.schedule_removal()
-        user_state.timeout_job = None
-
-    # Set up a new Processing message
-    processing_message = await query.message.reply_text(
-        "🔄 Loading more results... Please wait."
-    )
-
-    # Use the same send_paper_results function with the next page
-    await send_paper_results(
-        update, context, stored_query, processing_message, is_load_more=True
-    )
-
-
-# Send search results to the user, with optional "Load More" functionality
 async def send_paper_results(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     query: str,
     processing_message=None,
     is_load_more=False,
+    lang="en",
 ):
-    """Send search results to the user, with optional Load More functionality."""
-    # This function fetches and displays search results, adding a "Load More" button if needed
     try:
         user_id = update.effective_user.id
-
-        # Initialize user state if needed
         if user_id not in user_states:
-            user_states[user_id] = UserState()
+            user_states[user_id] = UserState(user_id)
 
         user_state = user_states[user_id]
 
-        # If this is a new search (not load more), reset the page counter
         if not is_load_more:
             user_state.current_page = 0
             user_state.query = query
-
-            # Clean up any existing Load More state for new searches
+            user_state.save_to_db()
             await cleanup_load_more_state(user_id, context)
 
         page = user_state.current_page
@@ -529,90 +591,77 @@ async def send_paper_results(
 
         logger.info(f"Searching arXiv for: {query} (page {page+1})")
 
-        # Start the progress bar task
         progress_task = asyncio.create_task(
-            update_progress_bar(update, context, processing_message)
+            update_progress_bar(update, context, processing_message, results_per_page)
         )
 
-        # Calculate the start index for pagination
         max_results = results_per_page if page == 0 else results_per_page * (page + 1)
-
-        # Perform the search with pagination
         result = search_arxiv(query, max_results=max_results)
 
-        # Cancel the progress bar task if it hasn't completed
         if not progress_task.done():
             progress_task.cancel()
 
-        # Delete the processing message if it exists
         if processing_message:
             try:
                 await processing_message.delete()
             except Exception as e:
                 logger.warning(f"Could not delete processing message: {e}")
 
-        # Check if the result is an error
         if isinstance(result, dict) and "error" in result:
             error_msg = result.get("message", "An unknown error occurred.")
-            await update.message.reply_text(
+            await update.effective_message.reply_text(
                 f"❌ {error_msg}", reply_markup=get_main_keyboard()
             )
             return
 
-        # Now we know result is a list of papers
         papers = result
-
         if not papers:
             await update.effective_message.reply_text(
-                "No papers found. Please try a different search term.",
+                LOCALES[lang]["no_papers"],
                 reply_markup=get_main_keyboard(),
             )
             return
 
-        # If this is a load more request, only show new papers
         if is_load_more and page > 0:
-            # Calculate the starting index for the new batch
             start_index = results_per_page * page
-            # If we've loaded all results already, don't show anything new
             if start_index >= len(papers):
                 await update.effective_message.reply_text(
-                    "No more papers available for this search.",
+                    LOCALES[lang]["no_more_papers"],
                     reply_markup=get_main_keyboard(),
                 )
                 return
-            # Get only the new papers
             papers_to_show = papers[start_index : start_index + results_per_page]
         else:
-            # For new searches, just show the first batch
             papers_to_show = papers[:results_per_page]
 
         if not is_load_more:
             logger.info(f"Found {len(papers)} papers for query: {query}")
             await update.effective_message.reply_text(
-                f"📚 Found {len(papers)} papers matching your search."
+                LOCALES[lang]["results_found"].format(count=len(papers))
             )
         else:
             logger.info(f"Loading more results for query: {query} (page {page+1})")
 
         for i, paper in enumerate(papers_to_show):
             try:
-                msg = f"📄 *{paper['title']}*\n\n{paper['summary']}\n\n🔗 [Read more]({paper['link']})"
+                msg = (
+                    f"📄 *{paper['title']}*\n\n"
+                    f"👤 Authors: {paper['authors']}\n"
+                    f"📅 Published: {paper['published']}\n"
+                    f"🏷️ Categories: {paper['categories']}\n\n"
+                    f"{paper['summary']}\n\n"
+                    f"🔗 [Read more]({paper['link']})"
+                )
 
-                # For the last paper in this batch
                 if i == len(papers_to_show) - 1:
-                    # Check if there are more papers to show
                     has_more = False
                     if is_load_more:
-                        # Check if there are more papers to load after this batch
                         next_index = results_per_page * (page + 1)
                         has_more = next_index < len(papers)
                     else:
-                        # For new searches, check if there are more results available
                         has_more = len(papers) > results_per_page
 
-                    # If we have more papers to show, add the "Load More" button
                     if has_more:
-                        # Create inline keyboard with Load More button
                         keyboard = [
                             [
                                 InlineKeyboardButton(
@@ -622,20 +671,17 @@ async def send_paper_results(
                         ]
                         reply_markup = InlineKeyboardMarkup(keyboard)
 
-                        # Send the last paper with the Load More button
                         last_message = await update.effective_message.reply_markdown(
                             msg, reply_markup=reply_markup
                         )
 
-                        # Store the timestamp and message ID for timeout handling
                         user_state.load_more_timestamp = datetime.now()
                         user_state.load_more_message_id = last_message.message_id
+                        user_state.save_to_db()
 
-                        # Cancel any existing timeout job
                         if user_state.timeout_job:
                             user_state.timeout_job.schedule_removal()
 
-                        # Schedule a new timeout job to remind user after inactivity
                         chat_id = update.effective_chat.id
                         job_data = {"user_id": user_id, "chat_id": chat_id}
 
@@ -648,93 +694,61 @@ async def send_paper_results(
                             f"Scheduled load_more timeout for user {user_id} in {LOAD_MORE_TIMEOUT} seconds"
                         )
                     else:
-                        # No more results to show, just send with main keyboard
                         await update.effective_message.reply_markdown(
                             msg, reply_markup=get_main_keyboard()
                         )
                 else:
-                    # For non-last papers in the batch, send without any buttons
                     await update.effective_message.reply_markdown(msg)
             except Exception as e:
                 logger.error(f"Error sending paper {i+1}: {e}")
                 continue
     except asyncio.CancelledError:
-        # Handle the case where the task is cancelled (e.g., during bot shutdown)
         logger.info("Paper search cancelled due to bot shutdown")
         if processing_message:
             try:
                 await processing_message.delete()
             except Exception:
                 pass
-
-        await update.message.reply_text(
-            "Search operation was cancelled. Please try again later.",
+        await update.effective_message.reply_text(
+            LOCALES[lang]["error"],
             reply_markup=get_main_keyboard(),
         )
     except Exception as e:
         logger.exception(f"Error in send_paper_results: {e}")
-        # Always make sure the keyboard is restored on error
         if processing_message:
             try:
                 await processing_message.delete()
             except Exception:
                 pass
-
-        await update.message.reply_text(
-            "Sorry, an error occurred while searching for papers. Please try again later.",
+        await update.effective_message.reply_text(
+            LOCALES[lang]["error"],
             reply_markup=get_main_keyboard(),
         )
 
 
-# Main entry point for the bot
 if __name__ == "__main__":
-    """Initialize the bot and start polling for updates."""
-    # This section sets up the bot, registers handlers, and starts polling for user messages
-    if not BOT_TOKEN:
-        raise ValueError("BOTAPI environment variable not set")
-
-    # Build application with default settings, letting python-telegram-bot
-    # handle its internal job queue implementation
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Example of scheduling a task (commented out)
-    # async def scheduled_task(context):
-    #     """Example function that would be scheduled to run periodically"""
-    #     print(f"Running scheduled task at {datetime.now()}")
-    #     # You could send messages to users, update data, etc.
-    #
-    # # Schedule the task to run every 24 hours
-    # app.job_queue.run_repeating(scheduled_task, interval=timedelta(hours=24), first=10)
-    #
-    # # Or schedule a one-time task
-    # app.job_queue.run_once(scheduled_task, when=timedelta(minutes=5))
-
-    # Add your handlers
-    # Register command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
-    # Register message handler for text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     logger.info(f"Python version: {sys.version}")
     logger.info(f"PTB version: {telegram.__version__}")
     logger.info("Bot is now running and ready to receive messages")
 
-    # Simplified run approach with proper error handling
     exit_code = 0
     shutdown_reason = "normal termination"
 
     logger.info("Starting bot polling...")
     try:
-        # Let python-telegram-bot handle its own signal handling
-        # This works well on both Windows and Unix systems
         app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         logger.info("Bot stopped by keyboard interrupt")
         shutdown_reason = "keyboard interrupt"
     except SystemExit:
-        # Clean exit, just pass through
         logger.info("System exit received")
         shutdown_reason = "system exit"
     except telegram.error.TelegramError as e:
@@ -750,22 +764,14 @@ if __name__ == "__main__":
         shutdown_reason = f"unhandled exception: {type(e).__name__}"
         exit_code = 1
     finally:
-        # Log detailed shutdown information
         logger.info(f"Beginning shutdown process (reason: {shutdown_reason})")
-
-        # Perform any needed cleanup operations here
         try:
-            # Release any resources if needed
             logger.info("Performing final cleanup")
-            # Clean up any custom resources here if needed
         except Exception as cleanup_error:
             logger.error(f"Error during cleanup: {cleanup_error}")
-            if exit_code == 0:  # Only set exit code if not already set
+            if exit_code == 0:
                 exit_code = 1
-
-        # Final shutdown message
         logger.info(f"Bot shutdown complete with exit code {exit_code}")
 
-    # Only exit with error code if there was an actual error
     if exit_code != 0:
         sys.exit(exit_code)
