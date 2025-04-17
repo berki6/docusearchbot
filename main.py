@@ -2,15 +2,15 @@ import os
 import sys
 import time
 import signal
-import signal
 import logging
 import asyncio
 import requests
-import enum
+import arxiv
 from datetime import datetime, timedelta
+from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 from pytz import utc
+
 import telegram
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
@@ -35,175 +35,79 @@ BOT_TOKEN = os.getenv("BOTAPI")
 user_states = {}  # Track user states for input
 
 
-# --- Progress tracking enum ---
-class SearchProgress(enum.Enum):
-    INITIALIZING = (0, "🔍 Initializing search...")
-    CONNECTING = (20, "🔌 Connecting to arXiv API...")
-    REQUESTING = (40, "📡 Sending request to arXiv...")
-    RECEIVING = (60, "📥 Receiving data from arXiv...")
-    PROCESSING = (80, "⚙️ Processing search results...")
-    FINALIZING = (95, "📊 Finalizing results...")
-    COMPLETE = (100, "✅ Search complete!")
-    ERROR_TIMEOUT = (-1, "⚠️ Connection timed out. Retrying...")
-    ERROR_CONNECTION = (-2, "❌ Connection error with arXiv API.")
-    ERROR_HTTP = (-3, "⚠️ HTTP error from arXiv API.")
-    ERROR_OTHER = (-4, "⚠️ Error during search.")
-
-    def __init__(self, percentage, message):
-        self.percentage = percentage
-        self.message = message
-
-
 # --- Helper to fetch from arXiv ---
-def search_arxiv(query: str, max_results=5, progress_callback=None):
+def search_arxiv(query: str, max_results=5):
     try:
-        # Signal initial progress
-        if progress_callback:
-            progress_callback(SearchProgress.INITIALIZING)
-            
-        session = requests.Session()
-
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=2,  # Increased backoff factor for exponential delays
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-            raise_on_status=True,
-            respect_retry_after_header=True,
-            # Retry on connection errors and read timeouts
-            connect=3,
-            read=3
-        )
-
-        # Configure connection pooling and reuse settings
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=10,
-            pool_block=False
-        )
-        session.mount("https://", adapter)
-
-        url = f"https://export.arxiv.org/api/query?search_query=all:{query}&start=0&max_results={max_results}"
-        logger.info("Requesting arXiv API with extended timeout and retry mechanism")
-
-        # Signal connecting progress
-        if progress_callback:
-            progress_callback(SearchProgress.CONNECTING)
-
-        # Signal requesting progress
-        if progress_callback:
-            progress_callback(SearchProgress.REQUESTING)
-            
-        response = session.get(url, timeout=60)  # Increased timeout to 60 seconds
+        logger.info(f"Searching arXiv using arxiv package for: {query}")
         
-        # Signal receiving progress
-        if progress_callback:
-            progress_callback(SearchProgress.RECEIVING)
-
+        # Create a search client with appropriate parameters
+        search = arxiv.Search(
+            query=query,
+            max_results=max_results,
+            sort_by=arxiv.SortCriterion.Relevance
+        )
+        
         entries = []
-
-        if response.status_code == 200:
-            from xml.etree import ElementTree as ET
-
+        
+        # Execute the search and process results
+        for result in search.results():
             try:
-                # Signal processing progress
-                if progress_callback:
-                    progress_callback(SearchProgress.PROCESSING)
-                    
-                root = ET.fromstring(response.content)
-                namespace = "{http://www.w3.org/2005/Atom}"
-
-                all_entries = root.findall(f"{namespace}entry")
-
-                for entry in all_entries:
-                    try:
-                        title_elem = entry.find(f"{namespace}title")
-                        link_elem = entry.find(f"{namespace}id")
-                        summary_elem = entry.find(f"{namespace}summary")
-
-                        if title_elem is None or link_elem is None:
-                            logger.warning("Missing required elements in entry")
-                            continue
-
-                        title = title_elem.text.strip()
-                        link = link_elem.text.strip()
-                        summary = ""
-                        if summary_elem is not None and summary_elem.text:
-                            summary = summary_elem.text.strip()[:500] + "..."
-                        else:
-                            summary = "No summary available"
-
-                        entries.append(
-                            {"title": title, "link": link, "summary": summary}
-                        )
-                    except Exception as e:
-                        logger.error(f"Error processing entry: {e}")
-                        continue
-            except ET.ParseError as e:
-                logger.error(f"Error parsing XML response: {e}")
-                # Signal error progress
-                if progress_callback:
-                    progress_callback(SearchProgress.ERROR_OTHER)
-        else:
-            logger.error(f"Bad status code: {response.status_code}")
-            # Signal HTTP error progress
-            if progress_callback:
-                progress_callback(SearchProgress.ERROR_HTTP)
-
+                title = result.title.strip()
+                link = result.entry_id  # This is the URL to the paper
+                
+                # Process the summary, limiting to 500 chars
+                if result.summary:
+                    summary = result.summary.strip()[:500] + "..."
+                else:
+                    summary = "No summary available"
+                
+                entries.append({
+                    "title": title, 
+                    "link": link,
+                    "summary": summary
+                })
+            except Exception as e:
+                logger.error(f"Error processing entry: {e}")
+                continue
+        
+        return entries
+        
+    except arxiv.HTTPError as e:
+        logger.error(f"HTTP error when accessing arXiv API: {e}")
+        return {
+            "error": "http",
+            "message": "Received HTTP error from arXiv. The service might be temporarily unavailable.",
+        }
+    except arxiv.UnexpectedEmptyPageError as e:
+        logger.error(f"Empty page error from arXiv API: {e}")
+        return {
+            "error": "empty_page",
+            "message": "Received unexpected empty results from arXiv. Please try a different search query.",
+        }
     except requests.exceptions.Timeout as e:
         logger.error(f"Timeout error when accessing arXiv API: {e}")
-        # Signal timeout error progress
-        if progress_callback:
-            progress_callback(SearchProgress.ERROR_TIMEOUT)
         return {
             "error": "timeout",
             "message": "The request to arXiv timed out. Please try again later.",
         }
     except requests.exceptions.ConnectionError as e:
         logger.error(f"Connection error when accessing arXiv API: {e}")
-        # Signal connection error progress
-        if progress_callback:
-            progress_callback(SearchProgress.ERROR_CONNECTION)
         return {
             "error": "connection",
             "message": "Could not connect to arXiv. Please check your internet connection and try again.",
         }
-    except requests.exceptions.HTTPError as e:
-        status_code = (
-            e.response.status_code
-            if hasattr(e, "response") and e.response
-            else "unknown"
-        )
-        logger.error(
-            f"HTTP error when accessing arXiv API: {e} (Status code: {status_code})"
-        )
-        return {
-            "error": "http",
-            "message": f"Received HTTP error {status_code} from arXiv. The service might be temporarily unavailable.",
-        }
     except requests.exceptions.RequestException as e:
         logger.error(f"Request exception when accessing arXiv API: {e}")
-        # Signal other error progress
-        if progress_callback:
-            progress_callback(SearchProgress.ERROR_OTHER)
         return {
             "error": "request",
             "message": "An error occurred while communicating with arXiv. Please try again later.",
         }
     except Exception as e:
         logger.exception(f"Error in search_arxiv: {e}")
-        # Signal other error progress
-        if progress_callback:
-            progress_callback(SearchProgress.ERROR_OTHER)
         return {
             "error": "unknown",
             "message": "An unexpected error occurred. Please try again later.",
         }
-    finally:
-        # Signal completion regardless of success or failure
-        if progress_callback:
-            progress_callback(SearchProgress.FINALIZING)
 
 
 # --- Helper function for keyboard ---
@@ -314,64 +218,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# Create a progress tracker class to hold state
-class ProgressTracker:
-    def __init__(self, processing_message):
-        self.processing_message = processing_message
-        self.last_percentage = 0
-        self.last_update_time = time.time()
-        self.update_queue = asyncio.Queue()
-        self.is_running = True
-
-    async def update_progress(self, progress_state):
-        # Add progress state to queue
-        await self.update_queue.put(progress_state)
-        
-    async def run_updates(self):
-        try:
-            while self.is_running:
-                # Get the next progress state or wait for one
-                try:
-                    progress_state = await asyncio.wait_for(self.update_queue.get(), 0.2)
-                    
-                    # Only update if enough time has passed (rate limiting) or it's an important update
-                    current_time = time.time()
-                    is_error = progress_state.percentage < 0
-                    is_significant_change = abs(progress_state.percentage - self.last_percentage) >= 10
-                    
-                    if (current_time - self.last_update_time >= 0.5) or is_error or is_significant_change:
-                        try:
-                            if self.processing_message:
-                                # Format percentage string only for positive percentages
-                                percentage_str = f" ({progress_state.percentage}%)" if progress_state.percentage >= 0 else ""
-                                await self.processing_message.edit_text(
-                                    text=f"{progress_state.message}{percentage_str}"
-                                )
-                                self.last_percentage = progress_state.percentage
-                                self.last_update_time = current_time
-                        except telegram.error.BadRequest as e:
-                            logger.warning(f"Failed to update progress: {e}")
-                            self.is_running = False
-                            break
-                        
-                    # Mark task as done
-                    self.update_queue.task_done()
-                    
-                    # If we're complete, exit the loop
-                    if progress_state == SearchProgress.COMPLETE:
-                        self.is_running = False
-                        break
-                        
-                except asyncio.TimeoutError:
-                    # Just continue the loop if no update received
-                    pass
-                    
-        except asyncio.CancelledError:
-            logger.info("Progress updates cancelled")
-            self.is_running = False
-        except Exception as e:
-            logger.exception(f"Error in progress updates: {e}")
-            self.is_running = False
+async def update_progress_bar(update, context, processing_message):
+    try:
+        for progress in range(0, 101, 10):  # Increment progress by 10%
+            await asyncio.sleep(1)  # Simulate progress every second
+            try:
+                if processing_message:
+                    await processing_message.edit_text(
+                        text=f"🔄 Searching... {progress}% complete"
+                    )
+            except telegram.error.BadRequest as e:
+                logger.warning(f"Failed to update progress: {e}")
+                break  # Stop updating if the message is deleted or edited elsewhere
+    except asyncio.CancelledError:
+        pass  # Handle cancellation gracefully
 
 
 async def send_paper_results(
@@ -383,39 +243,15 @@ async def send_paper_results(
     try:
         logger.info(f"Searching arXiv for: {query}")
 
-        # Create a progress tracker
-        progress_tracker = ProgressTracker(processing_message)
-        
-        # Start the progress updater task
+        # Start the progress bar task
         progress_task = asyncio.create_task(
-            progress_tracker.run_updates()
+            update_progress_bar(update, context, processing_message)
         )
-        
-        # Define the callback for search_arxiv
-        async def progress_callback(progress_state):
-            await progress_tracker.update_progress(progress_state)
 
         # Perform the search
-        # Run the search with the progress callback
-        # We need to run this in a separate thread to not block the asyncio event loop
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: search_arxiv(
-                query,
-                progress_callback=lambda state: asyncio.run_coroutine_threadsafe(
-                    progress_callback(state), loop
-                )
-            )
-        )
-        
-        # Signal completion and cancel the progress task if needed
-        await progress_tracker.update_progress(SearchProgress.COMPLETE)
-        
-        # Wait a moment for the complete message to be seen
-        await asyncio.sleep(0.5)
-        
-        # Cancel the progress task if it hasn't completed
+        result = search_arxiv(query)
+
+        # Cancel the progress bar task if it hasn't completed
         if not progress_task.done():
             progress_task.cancel()
 
