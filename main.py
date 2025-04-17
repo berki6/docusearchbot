@@ -386,21 +386,21 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def update_progress_bar(update, context, processing_message, total_results):
-    try:
-        steps = min(total_results, 5)
-        for i in range(0, 101, int(100 / steps)):
-            await asyncio.sleep(0.5)
-            try:
-                if processing_message:
-                    await processing_message.edit_text(
-                        text=f"🔄 Searching... {i}% complete"
-                    )
-            except TelegramError as e:
-                logger.warning(f"Failed to update progress: {e}")
-                break
-    except asyncio.CancelledError:
-        pass
+# async def update_progress_bar(update, context, processing_message, total_results):
+#     try:
+#         steps = min(total_results, 5)
+#         for i in range(0, 101, int(100 / steps)):
+#             await asyncio.sleep(0.5)
+#             try:
+#                 if processing_message:
+#                     await processing_message.edit_text(
+#                         text=f"🔄 Searching... {i}% complete"
+#                     )
+#             except TelegramError as e:
+#                 logger.warning(f"Failed to update progress: {e}")
+#                 break
+#     except asyncio.CancelledError:
+#         pass
 
 
 async def cleanup_load_more_state(user_id, context):
@@ -453,6 +453,43 @@ async def send_load_more_timeout_message(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_load_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    message_id = query.message.message_id
+
+    try:
+        lang = "en"
+    except:
+        lang = "en"
+
+    logger.info(f"Load More clicked by user {user_id} on message {message_id}")
+
+    if user_id not in user_states or not user_states[user_id].query:
+        logger.warning(
+            f"Invalid Load More: user_id={user_id}, query={user_states.get(user_id, 'None').query}"
+        )
+        await query.message.reply_text(
+            LOCALES[lang]["session_expired"], reply_markup=get_main_keyboard()
+        )
+        return
+
+    user_state = user_states[user_id]
+    stored_query = user_state.query
+    user_state.current_page += 1
+    user_state.save_to_db()
+
+    if user_state.timeout_job:
+        user_state.timeout_job.schedule_removal()
+        user_state.timeout_job = None
+
+    processing_message = await query.message.reply_text(LOCALES[lang]["searching"])
+
+    await send_paper_results(
+        update, context, stored_query, processing_message, is_load_more=True, lang=lang
+    )
     query = update.callback_query
     await query.answer()
 
@@ -591,15 +628,9 @@ async def send_paper_results(
 
         logger.info(f"Searching arXiv for: {query} (page {page+1})")
 
-        progress_task = asyncio.create_task(
-            update_progress_bar(update, context, processing_message, results_per_page)
-        )
-
-        max_results = results_per_page if page == 0 else results_per_page * (page + 1)
+        # Fetch more results to anticipate future "Load More" clicks
+        max_results = results_per_page * (page + 2)  # Increased to cover next page
         result = search_arxiv(query, max_results=max_results)
-
-        if not progress_task.done():
-            progress_task.cancel()
 
         if processing_message:
             try:
@@ -646,20 +677,20 @@ async def send_paper_results(
             try:
                 msg = (
                     f"📄 *{paper['title']}*\n\n"
-                    f"👤 Authors: {paper['authors']}\n"
+                    f"👤 Authors: {paper['authors']}\n\n"
                     f"📅 Published: {paper['published']}\n"
                     f"🏷️ Categories: {paper['categories']}\n\n"
                     f"{paper['summary']}\n\n"
                     f"🔗 [Read more]({paper['link']})"
                 )
 
+                # Add "Load More" button on the last paper if more results exist
                 if i == len(papers_to_show) - 1:
-                    has_more = False
-                    if is_load_more:
-                        next_index = results_per_page * (page + 1)
-                        has_more = next_index < len(papers)
-                    else:
-                        has_more = len(papers) > results_per_page
+                    next_index = results_per_page * (page + 1)
+                    has_more = next_index < len(papers)
+                    logger.info(
+                        f"has_more: {has_more}, next_index: {next_index}, total_papers: {len(papers)}"
+                    )
 
                     if has_more:
                         keyboard = [
