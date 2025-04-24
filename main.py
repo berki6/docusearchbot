@@ -386,23 +386,6 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# async def update_progress_bar(update, context, processing_message, total_results):
-#     try:
-#         steps = min(total_results, 5)
-#         for i in range(0, 101, int(100 / steps)):
-#             await asyncio.sleep(0.5)
-#             try:
-#                 if processing_message:
-#                     await processing_message.edit_text(
-#                         text=f"🔄 Searching... {i}% complete"
-#                     )
-#             except TelegramError as e:
-#                 logger.warning(f"Failed to update progress: {e}")
-#                 break
-#     except asyncio.CancelledError:
-#         pass
-
-
 async def cleanup_load_more_state(user_id, context):
     try:
         if user_id in user_states:
