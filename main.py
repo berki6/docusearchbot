@@ -100,6 +100,19 @@ def init_db():
                   last_search_time TEXT,
                   total_results INTEGER)"""
     )
+    # New pdf_downloads table
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_downloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp TEXT,
+            pdf_url TEXT,
+            file_size INTEGER,
+            FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+        )
+    """
+    )
     conn.commit()
     conn.close()
 
@@ -719,14 +732,13 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except TelegramError as e:
                 logger.warning(f"Failed to edit message to 'Uploading...': {e}")
-                # Send a new message instead
                 await processing_message.delete()
                 processing_message = await context.bot.send_message(
                     chat_id=chat_id,
                     text="📤 Uploading PDF to Telegram...",
                     reply_markup=keyboard,
                 )
-                await asyncio.sleep(1)  # Avoid rate limits
+                await asyncio.sleep(1)
 
             logger.info(f"Sending PDF: {pdf_url}")
             sent_message = await context.bot.send_document(
@@ -739,6 +751,31 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(
                 f"PDF sent successfully for paper: {paper['title']}, Message ID: {sent_message.message_id}"
             )
+
+            # Log PDF download to database
+            try:
+                conn = sqlite3.connect("user_states.db")
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO pdf_downloads (user_id, timestamp, pdf_url, file_size)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        datetime.utcnow().isoformat(),
+                        pdf_url,
+                        file_size if "file_size" in locals() else 0,
+                    ),
+                )
+                conn.commit()
+                logger.debug(
+                    f"Logged PDF download for user {user_id}: {pdf_url}, {file_size} bytes"
+                )
+            except sqlite3.Error as e:
+                logger.error(f"Failed to log PDF download: {e}")
+            finally:
+                conn.close()
 
             # Delete the processing message
             try:
@@ -947,15 +984,86 @@ async def send_paper_results(
         )
 
 
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or "N/A"
+    chat_id = update.message.chat_id
+    logger.info(f"Settings command received from user {user_id} (@{username})")
+
+    # Get today's date range
+    today = datetime.utcnow().date()
+    start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
+    end_of_day = datetime.combine(
+        today + timedelta(days=1), datetime.min.time()
+    ).isoformat()
+
+    # Query database for usage stats
+    try:
+        conn = sqlite3.connect("user_states.db")
+        cursor = conn.cursor()
+
+        # Count searches today (based on last_search_time in user_states)
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM user_states
+            WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
+            """,
+            (user_id, start_of_day, end_of_day),
+        )
+        searches_today = cursor.fetchone()[0]
+
+        # Count PDFs downloaded today and sum file sizes
+        cursor.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
+            WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+            """,
+            (user_id, start_of_day, end_of_day),
+        )
+        pdfs_downloaded, total_bytes = cursor.fetchone()
+        total_mb = total_bytes / (1024 * 1024)  # Convert bytes to MB
+        traffic_limit_mb = 1024  # 1,024 MB limit
+
+    except sqlite3.Error as e:
+        logger.error(f"Database error in settings: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Error fetching usage stats. Please try again later.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    finally:
+        conn.close()
+
+    # Format the message
+    message = (
+        "⚙️ Settings for Research Paper Finder\n\n"
+        f"🆔 User ID: {user_id}\n"
+        f"👤 Username: @{username if username != 'N/A' else 'None'}\n\n"
+        "📊 Bot Usage\n"
+        f"Searches Today: {searches_today}\n"
+        f"PDFs Downloaded Today: {pdfs_downloaded}\n\n"
+        "📈 Daily Usage\n"
+        f"Traffic: {total_mb:.1f} MB / {traffic_limit_mb} MB"
+    )
+
+    # Send the message
+    await context.bot.send_message(
+        chat_id=chat_id, text=message, reply_markup=get_main_keyboard()
+    )
+    logger.debug(f"Sent settings message to user {user_id}")
+
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
     app.add_handler(CallbackQueryHandler(download_paper, pattern="^download_"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
-    
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info(f"Python version: {sys.version}")
