@@ -562,13 +562,15 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     data = query.data
-    logger.info(f"Download button clicked by user {user_id}. Chat ID: {chat_id}, Callback data: {data}")
+    logger.info(
+        f"Download button clicked by user {user_id}. Chat ID: {chat_id}, Callback data: {data}"
+    )
 
     # Send initial feedback message
     logger.debug("Sending 'Fetching PDF...' message")
+    keyboard = get_main_keyboard()
     processing_message = await query.message.reply_text(
-        "📥 Fetching PDF... Please wait.",
-        reply_markup=get_main_keyboard()
+        "📥 Fetching PDF... Please wait.", reply_markup=keyboard
     )
 
     try:
@@ -576,46 +578,56 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"Checking user state for user_id: {user_id}")
         if user_id not in user_states:
             logger.warning(f"No user state found for user_id: {user_id}")
-            await processing_message.edit_text(
-                LOCALES["en"]["session_expired"],
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=LOCALES["en"]["session_expired"],
+                reply_markup=keyboard,
             )
+            await processing_message.delete()
             return
         user_state = user_states[user_id]
         if not user_state.query:
             logger.warning(f"No query in user state for user_id: {user_id}")
-            await processing_message.edit_text(
-                LOCALES["en"]["session_expired"],
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=LOCALES["en"]["session_expired"],
+                reply_markup=keyboard,
             )
+            await processing_message.delete()
             return
-        logger.debug(f"User state valid. Query: {user_state.query}, Total results: {user_state.total_results}")
+        logger.debug(
+            f"User state valid. Query: {user_state.query}, Total results: {user_state.total_results}"
+        )
 
         # Parse callback data
         logger.debug(f"Parsing callback data: {data}")
         try:
             if not data.startswith("download_"):
                 raise ValueError(f"Invalid callback data format: {data}")
-            paper_index = int(data[len("download_"):])
+            paper_index = int(data[len("download_") :])
             if paper_index < 0:
                 raise ValueError(f"Negative paper index: {paper_index}")
         except ValueError as e:
             logger.error(f"Failed to parse callback data: {e}")
-            await processing_message.edit_text(
-                LOCALES["en"]["error"],
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id, text=LOCALES["en"]["error"], reply_markup=keyboard
             )
+            await processing_message.delete()
             return
         logger.debug(f"Parsed paper_index: {paper_index}")
 
         # Validate paper index
-        logger.debug(f"Validating paper index against total_results: {user_state.total_results}")
+        logger.debug(
+            f"Validating paper index against total_results: {user_state.total_results}"
+        )
         if user_state.total_results > 0 and paper_index >= user_state.total_results:
-            logger.warning(f"Paper index {paper_index} exceeds total results: {user_state.total_results}")
-            await processing_message.edit_text(
-                LOCALES["en"]["no_papers"],
-                reply_markup=get_main_keyboard()
+            logger.warning(
+                f"Paper index {paper_index} exceeds total results: {user_state.total_results}"
             )
+            await context.bot.send_message(
+                chat_id=chat_id, text=LOCALES["en"]["no_papers"], reply_markup=keyboard
+            )
+            await processing_message.delete()
             return
 
         # Fetch papers from arXiv
@@ -624,31 +636,37 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_results = paper_index + 1
         try:
             result = search_arxiv(query_text, max_results=max_results)
-            logger.debug(f"arXiv search returned: {len(result) if isinstance(result, list) else result}")
+            logger.debug(
+                f"arXiv search returned: {len(result) if isinstance(result, list) else result}"
+            )
         except Exception as e:
             logger.error(f"arXiv search failed: {e}", exc_info=True)
-            await processing_message.edit_text(
-                f"Failed to fetch papers: {str(e)}",
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Failed to fetch papers: {str(e)}",
+                reply_markup=keyboard,
             )
+            await processing_message.delete()
             return
 
         if isinstance(result, dict) and "error" in result:
             error_msg = result.get("message", "An unknown error occurred.")
             logger.error(f"arXiv search error: {error_msg}")
-            await processing_message.edit_text(
-                f"❌ {error_msg}",
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"❌ {error_msg}", reply_markup=keyboard
             )
+            await processing_message.delete()
             return
 
         papers = result
         if paper_index >= len(papers):
-            logger.warning(f"Paper index {paper_index} out of range. Total papers: {len(papers)}")
-            await processing_message.edit_text(
-                LOCALES["en"]["no_papers"],
-                reply_markup=get_main_keyboard()
+            logger.warning(
+                f"Paper index {paper_index} out of range. Total papers: {len(papers)}"
             )
+            await context.bot.send_message(
+                chat_id=chat_id, text=LOCALES["en"]["no_papers"], reply_markup=keyboard
+            )
+            await processing_message.delete()
             return
 
         paper = papers[paper_index]
@@ -659,7 +677,9 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang = "en"
         try:
             session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            retries = Retry(
+                total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
+            )
             session.mount("http://", HTTPAdapter(max_retries=retries))
             session.mount("https://", HTTPAdapter(max_retries=retries))
 
@@ -667,11 +687,13 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = session.head(pdf_url, allow_redirects=True, timeout=10)
             logger.debug(f"HEAD response status: {response.status_code}")
             if response.status_code != 200:
-                logger.error(f"Failed to check PDF size. Status code: {response.status_code}")
-                await processing_message.edit_text(
-                    LOCALES[lang]["error"],
-                    reply_markup=get_main_keyboard()
+                logger.error(
+                    f"Failed to check PDF size. Status code: {response.status_code}"
                 )
+                await context.bot.send_message(
+                    chat_id=chat_id, text=LOCALES[lang]["error"], reply_markup=keyboard
+                )
+                await processing_message.delete()
                 return
 
             if "Content-Length" in response.headers:
@@ -679,70 +701,97 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.debug(f"PDF file size: {file_size} bytes")
                 if file_size > TELEGRAM_FILE_SIZE_LIMIT:
                     logger.warning(f"PDF too large: {file_size} bytes, URL: {pdf_url}")
-                    await processing_message.edit_text(
-                        LOCALES[lang]["file_too_large"].format(url=pdf_url),
-                        reply_markup=get_main_keyboard()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=LOCALES[lang]["file_too_large"].format(url=pdf_url),
+                        reply_markup=keyboard,
                     )
+                    await processing_message.delete()
                     return
             else:
                 logger.warning(f"No Content-Length header for PDF: {pdf_url}")
 
             # Update feedback to indicate uploading
-            await processing_message.edit_text("📤 Uploading PDF to Telegram...")
+            try:
+                logger.debug("Editing message to 'Uploading PDF...'")
+                await processing_message.edit_text(
+                    "📤 Uploading PDF to Telegram...", reply_markup=keyboard
+                )
+            except TelegramError as e:
+                logger.warning(f"Failed to edit message to 'Uploading...': {e}")
+                # Send a new message instead
+                await processing_message.delete()
+                processing_message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="📤 Uploading PDF to Telegram...",
+                    reply_markup=keyboard,
+                )
+                await asyncio.sleep(1)  # Avoid rate limits
 
             logger.info(f"Sending PDF: {pdf_url}")
-            await context.bot.send_document(
+            sent_message = await context.bot.send_document(
                 chat_id=chat_id,
                 document=pdf_url,
                 filename=f"{paper['title'].replace('/', '_').replace(':', '_')[:50]}.pdf",
                 caption=f"📄 {paper['title']}\n\n🔗 [Read more]({paper['link']})",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
-            logger.debug(f"PDF sent successfully for paper: {paper['title']}")
+            logger.debug(
+                f"PDF sent successfully for paper: {paper['title']}, Message ID: {sent_message.message_id}"
+            )
 
-            # Delete the processing message for a cleaner chat
-            await processing_message.delete()
+            # Delete the processing message
+            try:
+                await processing_message.delete()
+            except TelegramError as e:
+                logger.warning(f"Failed to delete processing message: {e}")
 
-            # Optional: Send confirmation message
+            # Send confirmation message
             await context.bot.send_message(
-                chat_id=chat_id,
-                text="✅ PDF sent successfully!",
-                reply_markup=get_main_keyboard()
+                chat_id=chat_id, text="✅ PDF sent successfully!", reply_markup=keyboard
             )
 
         except TelegramError as e:
             logger.error(f"Telegram API error sending PDF: {e}", exc_info=True)
-            await processing_message.edit_text(
-                f"Failed to send PDF: {str(e)}. The file may be too large or unavailable.",
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Failed to send PDF: {str(e)}. The file may be too large or unavailable.",
+                reply_markup=keyboard,
             )
+            try:
+                await processing_message.delete()
+            except TelegramError as e:
+                logger.warning(f"Failed to delete processing message: {e}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error fetching PDF: {e}", exc_info=True)
-            await processing_message.edit_text(
-                f"Network error downloading PDF: {str(e)}",
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Network error downloading PDF: {str(e)}",
+                reply_markup=keyboard,
             )
+            try:
+                await processing_message.delete()
+            except TelegramError as e:
+                logger.warning(f"Failed to delete processing message: {e}")
         except Exception as e:
             logger.error(f"Unexpected error in download_paper: {e}", exc_info=True)
-            await processing_message.edit_text(
-                LOCALES[lang]["error"],
-                reply_markup=get_main_keyboard()
+            await context.bot.send_message(
+                chat_id=chat_id, text=LOCALES[lang]["error"], reply_markup=keyboard
             )
+            try:
+                await processing_message.delete()
+            except TelegramError as e:
+                logger.warning(f"Failed to delete processing message: {e}")
 
     except Exception as e:
         logger.error(f"Error in download_paper setup: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id, text=LOCALES["en"]["error"], reply_markup=keyboard
+        )
         try:
-            await processing_message.edit_text(
-                LOCALES["en"]["error"],
-                reply_markup=get_main_keyboard()
-            )
-        except:
-            logger.warning("Failed to edit processing message")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=LOCALES["en"]["error"],
-                reply_markup=get_main_keyboard()
-            )
+            await processing_message.delete()
+        except TelegramError as e:
+            logger.warning(f"Failed to delete processing message: {e}")
 
 
 async def send_paper_results(
