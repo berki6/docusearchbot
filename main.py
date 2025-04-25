@@ -39,7 +39,7 @@ from telegram.ext import (
 
 # Set up logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.DEBUG
 )
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,7 @@ LOCALES = {
         "no_more_papers": "No more papers available for this search.",
         "timeout_message": '⏱️ It\'s been a while since you checked the "Load More" results. You can either click the "Load More" button to continue viewing results, or start a new search using the 🔍 Search button.',
         "session_expired": "Your search session has expired. Please start a new search.",
+        "file_too_large": "The PDF is too large to send via Telegram (>20 MB). You can download it directly here: {url}",
     },
     "es": {
         "welcome": "📚 ¡Bienvenido al Bot de Artículos de Investigación! Elige una opción:",
@@ -79,6 +80,7 @@ LOCALES = {
         "no_more_papers": "No hay más artículos disponibles para esta búsqueda.",
         "timeout_message": '⏱️ Ha pasado un tiempo desde que revisaste los resultados de "Cargar Más". Puedes hacer clic en el botón "Cargar Más" para continuar viendo resultados, o iniciar una nueva búsqueda usando el botón 🔍 Buscar.',
         "session_expired": "Tu sesión de búsqueda ha expirado. Por favor inicia una nueva búsqueda.",
+        "file_too_large": "El PDF es demasiado grande para enviar por Telegram (>20 MB). Puedes descargarlo directamente aquí: {url}",
     },
 }
 
@@ -95,7 +97,8 @@ def init_db():
                   current_page INTEGER,
                   load_more_timestamp TEXT,
                   load_more_message_id INTEGER,
-                  last_search_time TEXT)"""
+                  last_search_time TEXT,
+                  total_results INTEGER)"""
     )
     conn.commit()
     conn.close()
@@ -131,6 +134,7 @@ class UserState:
         self.user_id = user_id
         self.results_per_page = 5
         self.timeout_job = None
+        self.total_results = 0
         self._load_from_db()
 
     def _load_from_db(self):
@@ -149,6 +153,7 @@ class UserState:
             )
             self.load_more_message_id = data[5]
             self.last_search_time = datetime.fromisoformat(data[6]) if data[6] else None
+            self.total_results = data[7] if len(data) > 7 else 0
         else:
             self.state = None
             self.query = None
@@ -156,6 +161,7 @@ class UserState:
             self.load_more_timestamp = None
             self.load_more_message_id = None
             self.last_search_time = None
+            self.total_results = 0
 
     def save_to_db(self):
         conn = sqlite3.connect("user_states.db")
@@ -163,8 +169,8 @@ class UserState:
         c.execute(
             """INSERT OR REPLACE INTO user_states 
                     (user_id, state, query, current_page, load_more_timestamp, 
-                     load_more_message_id, last_search_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                     load_more_message_id, last_search_time, total_results)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 self.user_id,
                 self.state,
@@ -177,6 +183,7 @@ class UserState:
                 ),
                 self.load_more_message_id,
                 self.last_search_time.isoformat() if self.last_search_time else None,
+                self.total_results,
             ),
         )
         conn.commit()
@@ -187,6 +194,7 @@ user_states: Dict[int, UserState] = {}
 
 # Timeout settings
 LOAD_MORE_TIMEOUT = 300  # 5 minutes in seconds
+TELEGRAM_FILE_SIZE_LIMIT = 20 * 1024 * 1024  # 20 MB in bytes
 
 
 def search_arxiv(query: str, max_results=5):
@@ -366,7 +374,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     try:
-        lang = "en"  # Default to English for callback queries
+        lang = "en"
     except:
         lang = "en"
 
@@ -422,9 +430,7 @@ async def send_load_more_timeout_message(context: ContextTypes.DEFAULT_TYPE):
                 if chat_id:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=LOCALES["en"][
-                            "timeout_message"
-                        ],  # Default to English for timeout messages
+                        text=LOCALES["en"]["timeout_message"],
                         reply_markup=get_main_keyboard(),
                     )
                     user_state.timeout_job = None
@@ -548,78 +554,195 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# Add logging to debug callback query handling
 async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    logger.debug(f"Entering download_paper for callback_query: {query.data}")
 
     user_id = query.from_user.id
     chat_id = query.message.chat_id
     data = query.data
+    logger.info(f"Download button clicked by user {user_id}. Chat ID: {chat_id}, Callback data: {data}")
 
-    logger.info(f"Download button clicked. Callback data: {data}")  # Debug log
-
-    if user_id not in user_states or not user_states[user_id].query:
-        await query.message.reply_text(
-            "Your session has expired. Please start a new search.",
-            reply_markup=get_main_keyboard(),
-        )
-        return
-
-    try:
-        paper_index = int(data.split("_")[-1])  # Extract paper index from callback data
-    except ValueError:
-        logger.error(f"Invalid callback data format: {data}")
-        await query.message.reply_text(
-            "Invalid request. Please try again.", reply_markup=get_main_keyboard()
-        )
-        return
-
-    user_state = user_states[user_id]
-    query_text = user_state.query
-
-    # Fetch papers again to ensure we have the latest data
-    result = search_arxiv(
-        query_text, max_results=50
-    )  # Fetch more results to cover all indices
-
-    if isinstance(result, dict) and "error" in result:
-        error_msg = result.get("message", "An unknown error occurred.")
-        logger.error(f"Error fetching papers: {error_msg}")
-        await query.message.reply_text(
-            f"❌ {error_msg}", reply_markup=get_main_keyboard()
-        )
-        return
-
-    papers = result
-    if paper_index >= len(papers):
-        logger.warning(
-            f"Paper index {paper_index} out of range. Total papers: {len(papers)}"
-        )
-        await query.message.reply_text(
-            "No paper found at the specified index.", reply_markup=get_main_keyboard()
-        )
-        return
-
-    paper = papers[paper_index]
-    pdf_url = paper["link"].replace(
-        "abs", "pdf"
-    )  # Convert arXiv abstract URL to PDF URL
+    # Send initial feedback message
+    logger.debug("Sending 'Fetching PDF...' message")
+    processing_message = await query.message.reply_text(
+        "📥 Fetching PDF... Please wait.",
+        reply_markup=get_main_keyboard()
+    )
 
     try:
-        logger.info(f"Sending PDF: {pdf_url}")
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=pdf_url,
-            filename=f"{paper['title']}.pdf",
-            caption=f"📄 {paper['title']}\n\n🔗 [Read more]({paper['link']})",
-            parse_mode="Markdown",
-        )
+        # Validate user state
+        logger.debug(f"Checking user state for user_id: {user_id}")
+        if user_id not in user_states:
+            logger.warning(f"No user state found for user_id: {user_id}")
+            await processing_message.edit_text(
+                LOCALES["en"]["session_expired"],
+                reply_markup=get_main_keyboard()
+            )
+            return
+        user_state = user_states[user_id]
+        if not user_state.query:
+            logger.warning(f"No query in user state for user_id: {user_id}")
+            await processing_message.edit_text(
+                LOCALES["en"]["session_expired"],
+                reply_markup=get_main_keyboard()
+            )
+            return
+        logger.debug(f"User state valid. Query: {user_state.query}, Total results: {user_state.total_results}")
+
+        # Parse callback data
+        logger.debug(f"Parsing callback data: {data}")
+        try:
+            if not data.startswith("download_"):
+                raise ValueError(f"Invalid callback data format: {data}")
+            paper_index = int(data[len("download_"):])
+            if paper_index < 0:
+                raise ValueError(f"Negative paper index: {paper_index}")
+        except ValueError as e:
+            logger.error(f"Failed to parse callback data: {e}")
+            await processing_message.edit_text(
+                LOCALES["en"]["error"],
+                reply_markup=get_main_keyboard()
+            )
+            return
+        logger.debug(f"Parsed paper_index: {paper_index}")
+
+        # Validate paper index
+        logger.debug(f"Validating paper index against total_results: {user_state.total_results}")
+        if user_state.total_results > 0 and paper_index >= user_state.total_results:
+            logger.warning(f"Paper index {paper_index} exceeds total results: {user_state.total_results}")
+            await processing_message.edit_text(
+                LOCALES["en"]["no_papers"],
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        # Fetch papers from arXiv
+        query_text = user_state.query
+        logger.debug(f"Fetching paper {paper_index} for query: {query_text}")
+        max_results = paper_index + 1
+        try:
+            result = search_arxiv(query_text, max_results=max_results)
+            logger.debug(f"arXiv search returned: {len(result) if isinstance(result, list) else result}")
+        except Exception as e:
+            logger.error(f"arXiv search failed: {e}", exc_info=True)
+            await processing_message.edit_text(
+                f"Failed to fetch papers: {str(e)}",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        if isinstance(result, dict) and "error" in result:
+            error_msg = result.get("message", "An unknown error occurred.")
+            logger.error(f"arXiv search error: {error_msg}")
+            await processing_message.edit_text(
+                f"❌ {error_msg}",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        papers = result
+        if paper_index >= len(papers):
+            logger.warning(f"Paper index {paper_index} out of range. Total papers: {len(papers)}")
+            await processing_message.edit_text(
+                LOCALES["en"]["no_papers"],
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        paper = papers[paper_index]
+        pdf_url = paper["link"].replace("abs", "pdf") + ".pdf"
+        logger.debug(f"Attempting to download PDF from: {pdf_url}")
+
+        # Check file size
+        lang = "en"
+        try:
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount("http://", HTTPAdapter(max_retries=retries))
+            session.mount("https://", HTTPAdapter(max_retries=retries))
+
+            logger.debug(f"Sending HEAD request to check PDF size: {pdf_url}")
+            response = session.head(pdf_url, allow_redirects=True, timeout=10)
+            logger.debug(f"HEAD response status: {response.status_code}")
+            if response.status_code != 200:
+                logger.error(f"Failed to check PDF size. Status code: {response.status_code}")
+                await processing_message.edit_text(
+                    LOCALES[lang]["error"],
+                    reply_markup=get_main_keyboard()
+                )
+                return
+
+            if "Content-Length" in response.headers:
+                file_size = int(response.headers["Content-Length"])
+                logger.debug(f"PDF file size: {file_size} bytes")
+                if file_size > TELEGRAM_FILE_SIZE_LIMIT:
+                    logger.warning(f"PDF too large: {file_size} bytes, URL: {pdf_url}")
+                    await processing_message.edit_text(
+                        LOCALES[lang]["file_too_large"].format(url=pdf_url),
+                        reply_markup=get_main_keyboard()
+                    )
+                    return
+            else:
+                logger.warning(f"No Content-Length header for PDF: {pdf_url}")
+
+            # Update feedback to indicate uploading
+            await processing_message.edit_text("📤 Uploading PDF to Telegram...")
+
+            logger.info(f"Sending PDF: {pdf_url}")
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=pdf_url,
+                filename=f"{paper['title'].replace('/', '_').replace(':', '_')[:50]}.pdf",
+                caption=f"📄 {paper['title']}\n\n🔗 [Read more]({paper['link']})",
+                parse_mode="Markdown"
+            )
+            logger.debug(f"PDF sent successfully for paper: {paper['title']}")
+
+            # Delete the processing message for a cleaner chat
+            await processing_message.delete()
+
+            # Optional: Send confirmation message
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="✅ PDF sent successfully!",
+                reply_markup=get_main_keyboard()
+            )
+
+        except TelegramError as e:
+            logger.error(f"Telegram API error sending PDF: {e}", exc_info=True)
+            await processing_message.edit_text(
+                f"Failed to send PDF: {str(e)}. The file may be too large or unavailable.",
+                reply_markup=get_main_keyboard()
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error fetching PDF: {e}", exc_info=True)
+            await processing_message.edit_text(
+                f"Network error downloading PDF: {str(e)}",
+                reply_markup=get_main_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error in download_paper: {e}", exc_info=True)
+            await processing_message.edit_text(
+                LOCALES[lang]["error"],
+                reply_markup=get_main_keyboard()
+            )
+
     except Exception as e:
-        logger.error(f"Error sending PDF: {e}")
-        await query.message.reply_text(
-            "An error occurred while sending the PDF.", reply_markup=get_main_keyboard()
-        )
+        logger.error(f"Error in download_paper setup: {e}", exc_info=True)
+        try:
+            await processing_message.edit_text(
+                LOCALES["en"]["error"],
+                reply_markup=get_main_keyboard()
+            )
+        except:
+            logger.warning("Failed to edit processing message")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=LOCALES["en"]["error"],
+                reply_markup=get_main_keyboard()
+            )
 
 
 async def send_paper_results(
@@ -648,8 +771,7 @@ async def send_paper_results(
 
         logger.info(f"Searching arXiv for: {query} (page {page+1})")
 
-        # Fetch more results to anticipate future "Load More" clicks
-        max_results = results_per_page * (page + 2)  # Increased to cover next page
+        max_results = results_per_page * (page + 2)
         result = search_arxiv(query, max_results=max_results)
 
         if processing_message:
@@ -687,6 +809,8 @@ async def send_paper_results(
 
         if not is_load_more:
             logger.info(f"Found {len(papers)} papers for query: {query}")
+            user_state.total_results = len(papers)
+            user_state.save_to_db()
             await update.effective_message.reply_text(
                 LOCALES[lang]["results_found"].format(count=len(papers))
             )
@@ -695,6 +819,8 @@ async def send_paper_results(
 
         for i, paper in enumerate(papers_to_show):
             try:
+                global_index = (page * results_per_page) + i
+
                 msg = (
                     f"📄 *{paper['title']}*\n\n"
                     f"👤 Authors: {paper['authors']}\n\n"
@@ -704,16 +830,14 @@ async def send_paper_results(
                     f"🔗 [Read more]({paper['link']})"
                 )
 
-                # Add "Download PDF" button for each paper
                 keyboard = [
                     [
                         InlineKeyboardButton(
-                            "📄 Download PDF", callback_data=f"download_{i}"
+                            "📄 Download PDF", callback_data=f"download_{global_index}"
                         )
                     ]
                 ]
 
-                # Add "Load More" button on the last paper if more results exist
                 if i == len(papers_to_show) - 1:
                     next_index = results_per_page * (page + 1)
                     has_more = next_index < len(papers)
@@ -738,6 +862,18 @@ async def send_paper_results(
             except Exception as e:
                 logger.error(f"Error sending paper {i+1}: {e}")
                 continue
+
+        if len(papers_to_show) == results_per_page and (
+            page + 1
+        ) * results_per_page < len(papers):
+            user_state.load_more_timestamp = datetime.now()
+            user_state.timeout_job = context.job_queue.run_once(
+                send_load_more_timeout_message,
+                LOAD_MORE_TIMEOUT,
+                data={"user_id": user_id, "chat_id": update.effective_chat.id},
+                name=f"timeout_{user_id}",
+            )
+            user_state.save_to_db()
     except asyncio.CancelledError:
         logger.info("Paper search cancelled due to bot shutdown")
         if processing_message:
@@ -768,8 +904,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(CallbackQueryHandler(download_paper, pattern="^download_"))
+    app.add_handler(CallbackQueryHandler(handle_buttons))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info(f"Python version: {sys.version}")
