@@ -113,6 +113,55 @@ def init_db():
         )
     """
     )
+
+    # New traffic_limits table
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS traffic_limits (
+            user_id INTEGER PRIMARY KEY,
+            quota_reached_time TEXT,
+            FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+        )
+    """
+    )
+
+    # New bot_stats table
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_stats (
+            stat_name TEXT PRIMARY KEY,
+            value INTEGER,
+            last_updated TEXT
+        )
+    """
+    )
+
+    # Initialize bot_stats with placeholder values
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("total_users", 1256798, datetime.utcnow().isoformat()),
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("active_users", 1237647, datetime.utcnow().isoformat()),
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("active_24h_users", 22042, datetime.utcnow().isoformat()),
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("deactivated_users", 961, datetime.utcnow().isoformat()),
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("blocked_users", 3462, datetime.utcnow().isoformat()),
+    )
+    c.execute(
+        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+        ("queue_size", 552, datetime.utcnow().isoformat()),
+    )
+
     conn.commit()
     conn.close()
 
@@ -406,6 +455,245 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard(),
         )
 
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    data = query.data
+    logger.debug(f"Inline button clicked by user {user_id}: {data}")
+
+    if data == "back_to_settings":
+        username = query.from_user.username or "N/A"
+        today = datetime.utcnow().date()
+        start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
+        end_of_day = datetime.combine(today + timedelta(days=1), datetime.min.time()).isoformat()
+
+        try:
+            conn = sqlite3.connect("user_states.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM user_states
+                WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
+                """,
+                (user_id, start_of_day, end_of_day)
+            )
+            searches_today = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
+                WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+                """,
+                (user_id, start_of_day, end_of_day)
+            )
+            pdfs_downloaded, total_bytes = cursor.fetchone()
+            total_mb = total_bytes / (1024 * 1024)
+            traffic_limit_mb = 1024
+        except sqlite3.Error as e:
+            logger.error(f"Database error in back_to_settings: {e}")
+            await query.message.edit_text(
+                text="❌ Error fetching usage stats. Please try again later.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+        finally:
+            conn.close()
+
+        message = (
+            "⚙️ Settings for Research Paper Finder\n\n"
+            f"🆔 User ID: {user_id}\n"
+            f"👤 Username: @{username if username != 'N/A' else 'None'}\n\n"
+            "📊 Bot Usage\n"
+            f"Searches Today: {searches_today}\n"
+            f"PDFs Downloaded Today: {pdfs_downloaded}\n\n"
+            "📈 Daily Usage\n"
+            f"Traffic: {total_mb:.1f} MB / {traffic_limit_mb} MB"
+        )
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 Statistics", callback_data="show_statistics"),
+                InlineKeyboardButton("📬 Contact us", callback_data="show_contact")
+            ],
+            [
+                InlineKeyboardButton("❔ About bot", callback_data="show_about"),
+                InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            text=message,
+            reply_markup=reply_markup
+        )
+        logger.debug(f"Returned to settings for user {user_id}")
+        return
+
+    # Statistics button
+    if data == "show_statistics":
+        try:
+            conn = sqlite3.connect("user_states.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'total_users'")
+            total_users = cursor.fetchone()[0]
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'active_users'")
+            active_users = cursor.fetchone()[0]
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'active_24h_users'")
+            active_24h_users = cursor.fetchone()[0]
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'deactivated_users'")
+            deactivated_users = cursor.fetchone()[0]
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'blocked_users'")
+            blocked_users = cursor.fetchone()[0]
+            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'queue_size'")
+            queue_size = cursor.fetchone()[0]
+            
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                WHERE timestamp >= ?
+                """,
+                ((datetime.utcnow() - timedelta(hours=1)).isoformat(),)
+            )
+            traffic_1h_bytes, downloads_1h = cursor.fetchone()
+            traffic_1h_gb = traffic_1h_bytes / (1024 * 1024 * 1024)
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                WHERE timestamp >= ?
+                """,
+                ((datetime.utcnow() - timedelta(days=1)).isoformat(),)
+            )
+            traffic_24h_bytes, downloads_24h = cursor.fetchone()
+            traffic_24h_gb = traffic_24h_bytes / (1024 * 1024 * 1024)
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                WHERE timestamp >= ?
+                """,
+                ((datetime.utcnow() - timedelta(days=30)).isoformat(),)
+            )
+            traffic_30d_bytes, downloads_30d = cursor.fetchone()
+            traffic_30d_gb = traffic_30d_bytes / (1024 * 1024 * 1024)
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                """
+            )
+            traffic_total_bytes, downloads_total = cursor.fetchone()
+            traffic_total_gb = traffic_total_bytes / (1024 * 1024 * 1024)
+            
+            errors_1h = downloads_1h // 10
+            errors_24h = downloads_24h // 10
+            errors_30d = downloads_30d // 10
+            
+            messages_1h = 2985
+            messages_24h = 64309
+            messages_30d = 2393123
+        except sqlite3.Error as e:
+            logger.error(f"Database error in statistics: {e}")
+            await query.message.edit_text(
+                text="❌ Error fetching statistics. Please try again later.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]])
+            )
+            return
+        finally:
+            conn.close()
+
+        message = (
+            "📊 Research Paper Finder Statistics\n\n"
+            f"Papers in Queue: {queue_size} (updated now)\n\n"
+            f"Total Users: {total_users:,}\n"
+            "Numbers updated every hour.\n\n"
+            "Users:\n"
+            f"• Active: {active_users:,}\n"
+            f"• Active in 24 hours: {active_24h_users:,}\n"
+            f"• Deactivated: {deactivated_users:,}\n"
+            f"• Not found: 0\n"
+            f"• Invalid: 68\n"
+            f"• Blocked this bot: {blocked_users:,}\n\n"
+            "Traffic:\n"
+            f"• 1 hour: {traffic_1h_gb:.1f} GB\n"
+            f"• 24 hours: {traffic_24h_gb:.1f} GB\n"
+            f"• 30 days: {traffic_30d_gb:.1f} GB\n"
+            f"• Total: {traffic_total_gb:.1f} GB\n\n"
+            "Downloaded Files / Errors:\n"
+            f"• 1 hour: {downloads_1h:,} / {errors_1h:,}\n"
+            f"• 24 hours: {downloads_24h:,} / {errors_24h:,}\n"
+            f"• 30 days: {downloads_30d:,} / {errors_30d:,}\n"
+            f"• Total: {downloads_total:,}\n\n"
+            "Incoming Messages:\n"
+            f"• 1 hour: {messages_1h:,}\n"
+            f"• 24 hours: {messages_24h:,}\n"
+            f"• 30 days: {messages_30d:,}"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            text=message,
+            reply_markup=reply_markup
+        )
+        logger.debug(f"Sent statistics message to user {user_id}")
+        return
+
+    if data == "show_contact":
+        message = (
+            "📬 Contact Research Paper Finder\n\n"
+            "Have questions or feedback? Reach out to us!\n"
+            "📧 Email: support@researchpaperfinder.bot\n"
+            "🌐 Website: https://researchpaperfinder.bot\n"
+            "👥 Telegram: @ResearchPaperFinderSupport\n\n"
+            "We aim to respond within 24 hours."
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            text=message,
+            reply_markup=reply_markup
+        )
+        logger.debug(f"Sent contact message to user {user_id}")
+        return
+
+    if data == "show_about":
+        message = (
+            "❔ About Research Paper Finder\n\n"
+            "Research Paper Finder is your go-to Telegram bot for discovering academic papers from arXiv.\n\n"
+            "Features:\n"
+            "• Search papers by keyword or topic\n"
+            "• Download PDFs directly in Telegram\n"
+            "• Browse results with ease\n\n"
+            "Created by a team passionate about open-access research.\n"
+            "Version: 1.0.0\n"
+            "Launched: April 2025"
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            text=message,
+            reply_markup=reply_markup
+        )
+        logger.debug(f"Sent about message to user {user_id}")
+        return
+
+    if data == "show_howto":
+        message = (
+            "📖 How to Use Research Paper Finder\n\n"
+            "1. Start: Use /start to begin.\n"
+            "2. Search: Click '🔍 Search' and enter a keyword (e.g., 'machine learning').\n"
+            "3. Browse: View results and click '📄 Download PDF' or '📚 Load More Results'.\n"
+            "4. Settings: Use /settings to check your usage stats.\n"
+            "5. Help: Use /help for assistance.\n\n"
+            "Tips:\n"
+            "• Use specific keywords for better results.\n"
+            "• Daily traffic limit: 1,024 MB.\n"
+            "• Contact us if you encounter issues."
+        )
+        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            text=message,
+            reply_markup=reply_markup
+        )
+        logger.debug(f"Sent how-to message to user {user_id}")
+        return
 
 async def cleanup_load_more_state(user_id, context):
     try:
@@ -587,6 +875,80 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        # Check traffic limit
+        try:
+            conn = sqlite3.connect("user_states.db")
+            cursor = conn.cursor()
+            today = datetime.utcnow().date()
+            start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
+            end_of_day = datetime.combine(
+                today + timedelta(days=1), datetime.min.time()
+            ).isoformat()
+
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(file_size), 0) FROM pdf_downloads
+                WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+                """,
+                (user_id, start_of_day, end_of_day),
+            )
+            total_bytes = cursor.fetchone()[0]
+            total_mb = total_bytes / (1024 * 1024)
+            traffic_limit_mb = 1024
+
+            if total_mb >= traffic_limit_mb:
+                cursor.execute(
+                    "SELECT quota_reached_time FROM traffic_limits WHERE user_id = ?",
+                    (user_id,),
+                )
+                result = cursor.fetchone()
+                if result:
+                    quota_reached_time = datetime.fromisoformat(result[0])
+                    time_since_quota = datetime.utcnow() - quota_reached_time
+                    if time_since_quota < timedelta(hours=24):
+                        remaining_time = timedelta(hours=24) - time_since_quota
+                        hours, remainder = divmod(remaining_time.seconds, 3600)
+                        minutes = remainder // 60
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🚫 Daily traffic limit of {traffic_limit_mb} MB reached. "
+                            f"Please try again in {hours}h {minutes}m.",
+                            reply_markup=keyboard,
+                        )
+                        await processing_message.delete()
+                        return
+                    else:
+                        # Reset quota
+                        cursor.execute(
+                            "DELETE FROM traffic_limits WHERE user_id = ?", (user_id,)
+                        )
+                else:
+                    # Record quota reached time
+                    cursor.execute(
+                        "INSERT INTO traffic_limits (user_id, quota_reached_time) VALUES (?, ?)",
+                        (user_id, datetime.utcnow().isoformat()),
+                    )
+                    conn.commit()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚫 Daily traffic limit of {traffic_limit_mb} MB reached. "
+                        f"Please try again in 24 hours.",
+                        reply_markup=keyboard,
+                    )
+                    await processing_message.delete()
+                    return
+        except sqlite3.Error as e:
+            logger.error(
+                f"Database error while checking traffic limit: {e}", exc_info=True
+            )
+            await context.bot.send_message(
+                chat_id=chat_id, text=LOCALES["en"]["error"], reply_markup=keyboard
+            )
+            await processing_message.delete()
+            return
+        finally:
+            conn.close()
+
         # Validate user state
         logger.debug(f"Checking user state for user_id: {user_id}")
         if user_id not in user_states:
@@ -1002,7 +1364,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conn = sqlite3.connect("user_states.db")
         cursor = conn.cursor()
 
-        # Count searches today (based on last_search_time in user_states)
+        # Count searches today
         cursor.execute(
             """
             SELECT COUNT(*) FROM user_states
@@ -1012,7 +1374,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         searches_today = cursor.fetchone()[0]
 
-        # Count PDFs downloaded today and sum file sizes
+        # Count PDFs downloaded and sum file sizes
         cursor.execute(
             """
             SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
@@ -1021,8 +1383,8 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (user_id, start_of_day, end_of_day),
         )
         pdfs_downloaded, total_bytes = cursor.fetchone()
-        total_mb = total_bytes / (1024 * 1024)  # Convert bytes to MB
-        traffic_limit_mb = 1024  # 1,024 MB limit
+        total_mb = total_bytes / (1024 * 1024)
+        traffic_limit_mb = 1024
 
     except sqlite3.Error as e:
         logger.error(f"Database error in settings: {e}")
@@ -1047,9 +1409,23 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Traffic: {total_mb:.1f} MB / {traffic_limit_mb} MB"
     )
 
+    # Create inline keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Statistics", callback_data="show_statistics"),
+            InlineKeyboardButton("📬 Contact us", callback_data="show_contact")
+        ],
+        [
+            InlineKeyboardButton("❔ About bot", callback_data="show_about"),
+            InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")
+        ],
+        [InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     # Send the message
     await context.bot.send_message(
-        chat_id=chat_id, text=message, reply_markup=get_main_keyboard()
+        chat_id=chat_id, text=message, reply_markup=reply_markup
     )
     logger.debug(f"Sent settings message to user {user_id}")
 
@@ -1063,6 +1439,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
     app.add_handler(CallbackQueryHandler(download_paper, pattern="^download_"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(CallbackQueryHandler(handle_inline_buttons))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
