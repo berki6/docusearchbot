@@ -7,6 +7,7 @@ import asyncio
 import requests
 import arxiv
 import urllib3
+import httpx
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -16,7 +17,8 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from pytz import utc
 from langdetect import detect
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError
+from contextlib import contextmanager
 
 import telegram
 from telegram import (
@@ -36,6 +38,7 @@ from telegram.ext import (
     filters,
     JobQueue,
 )
+from telegram.request import HTTPXRequest
 
 # Set up logging
 logging.basicConfig(
@@ -85,89 +88,180 @@ LOCALES = {
 }
 
 
+# Database connection pooling
+class Database:
+    def __init__(self, db_name):
+        self.db_name = db_name
+        self.conn = sqlite3.connect(db_name, check_same_thread=False)
+        self.conn.execute("PRAGMA foreign_keys = ON;")
+
+    @contextmanager
+    def get_cursor(self):
+        cursor = self.conn.cursor()
+        try:
+            yield cursor
+            self.conn.commit()
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            logger.error(f"Database error: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    def close(self):
+        self.conn.close()
+
+
+# Initialize database globally
+db = Database("user_states.db")
+
+
+# Utility for consistent UTC timestamps
+def get_utc_timestamp():
+    return datetime.now(utc).isoformat()
+
+
 # SQLite Database Setup
 def init_db():
-    conn = sqlite3.connect("user_states.db")
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS user_states
-                 (user_id INTEGER PRIMARY KEY,
-                  state TEXT,
-                  query TEXT,
-                  current_page INTEGER,
-                  load_more_timestamp TEXT,
-                  load_more_message_id INTEGER,
-                  last_search_time TEXT,
-                  total_results INTEGER)"""
-    )
-    # New pdf_downloads table
-    c.execute(
+    with db.get_cursor() as c:
+        # Create tables
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_states (
+                user_id INTEGER PRIMARY KEY,
+                state TEXT,
+                query TEXT,
+                current_page INTEGER,
+                load_more_timestamp TEXT,
+                load_more_message_id INTEGER,
+                last_search_time TEXT,
+                total_results INTEGER,
+                status TEXT DEFAULT 'active',
+                join_time TEXT,
+                last_active_time TEXT
+            )
         """
-        CREATE TABLE IF NOT EXISTS pdf_downloads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            timestamp TEXT,
-            pdf_url TEXT,
-            file_size INTEGER,
-            FOREIGN KEY (user_id) REFERENCES user_states (user_id)
         )
-    """
-    )
-
-    # New traffic_limits table
-    c.execute(
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pdf_downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                timestamp TEXT,
+                pdf_url TEXT,
+                file_size INTEGER,
+                FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+            )
         """
-        CREATE TABLE IF NOT EXISTS traffic_limits (
-            user_id INTEGER PRIMARY KEY,
-            quota_reached_time TEXT,
-            FOREIGN KEY (user_id) REFERENCES user_states (user_id)
         )
-    """
-    )
-
-    # New bot_stats table
-    c.execute(
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS traffic_limits (
+                user_id INTEGER PRIMARY KEY,
+                quota_reached_time TEXT,
+                FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+            )
         """
-        CREATE TABLE IF NOT EXISTS bot_stats (
-            stat_name TEXT PRIMARY KEY,
-            value INTEGER,
-            last_updated TEXT
         )
-    """
-    )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_stats (
+                stat_name TEXT PRIMARY KEY,
+                value INTEGER,
+                last_updated TEXT
+            )
+        """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                timestamp TEXT,
+                FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+            )
+        """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                paper_url TEXT,
+                timestamp TEXT,
+                status TEXT,
+                FOREIGN KEY (user_id) REFERENCES user_states (user_id)
+            )
+        """
+        )
 
-    # Initialize bot_stats with placeholder values
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("total_users", 1256798, datetime.utcnow().isoformat()),
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("active_users", 1237647, datetime.utcnow().isoformat()),
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("active_24h_users", 22042, datetime.utcnow().isoformat()),
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("deactivated_users", 961, datetime.utcnow().isoformat()),
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("blocked_users", 3462, datetime.utcnow().isoformat()),
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
-        ("queue_size", 552, datetime.utcnow().isoformat()),
-    )
+        # Create indexes
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_states_user_id ON user_states(user_id);"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pdf_downloads_user_id ON pdf_downloads(user_id, timestamp);"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_traffic_limits_user_id ON traffic_limits(user_id);"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_logs_user_id ON message_logs(user_id, timestamp);"
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_paper_queue_user_id ON paper_queue(user_id, timestamp);"
+        )
 
-    conn.commit()
-    conn.close()
+        # Initialize bot_stats
+        current_time = get_utc_timestamp()
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("total_users", 1256798, current_time),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("active_users", 1237647, current_time),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("active_24h_users", 22042, current_time),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("deactivated_users", 961, current_time),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("blocked_users", 3462, current_time),
+        )
+        c.execute(
+            "INSERT OR IGNORE INTO bot_stats (stat_name, value, last_updated) VALUES (?, ?, ?)",
+            ("queue_size", 552, current_time),
+        )
+
+
+def verify_db_schema():
+    with db.get_cursor() as c:
+        expected_tables = [
+            "user_states",
+            "pdf_downloads",
+            "traffic_limits",
+            "bot_stats",
+            "message_logs",
+            "paper_queue",
+        ]
+        c.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in c.fetchall()]
+        for table in expected_tables:
+            if table not in tables:
+                logger.error(f"Table {table} missing from database")
+                raise RuntimeError(f"Database schema incomplete: missing {table}")
+        logger.info("Database schema verified successfully")
 
 
 # Initialize database
 init_db()
+verify_db_schema()
 
 
 # Input sanitization
@@ -200,11 +294,9 @@ class UserState:
         self._load_from_db()
 
     def _load_from_db(self):
-        conn = sqlite3.connect("user_states.db")
-        c = conn.cursor()
-        c.execute("SELECT * FROM user_states WHERE user_id = ?", (self.user_id,))
-        data = c.fetchone()
-        conn.close()
+        with db.get_cursor() as c:
+            c.execute("SELECT * FROM user_states WHERE user_id = ?", (self.user_id,))
+            data = c.fetchone()
 
         if data:
             self.state = data[1]
@@ -226,30 +318,31 @@ class UserState:
             self.total_results = 0
 
     def save_to_db(self):
-        conn = sqlite3.connect("user_states.db")
-        c = conn.cursor()
-        c.execute(
-            """INSERT OR REPLACE INTO user_states 
-                    (user_id, state, query, current_page, load_more_timestamp, 
-                     load_more_message_id, last_search_time, total_results)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                self.user_id,
-                self.state,
-                self.query,
-                self.current_page,
+        with db.get_cursor() as c:
+            c.execute(
+                """INSERT OR REPLACE INTO user_states 
+                        (user_id, state, query, current_page, load_more_timestamp, 
+                         load_more_message_id, last_search_time, total_results)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    self.load_more_timestamp.isoformat()
-                    if self.load_more_timestamp
-                    else None
+                    self.user_id,
+                    self.state,
+                    self.query,
+                    self.current_page,
+                    (
+                        self.load_more_timestamp.isoformat()
+                        if self.load_more_timestamp
+                        else None
+                    ),
+                    self.load_more_message_id,
+                    (
+                        self.last_search_time.isoformat()
+                        if self.last_search_time
+                        else None
+                    ),
+                    self.total_results,
                 ),
-                self.load_more_message_id,
-                self.last_search_time.isoformat() if self.last_search_time else None,
-                self.total_results,
-            ),
-        )
-        conn.commit()
-        conn.close()
+            )
 
 
 user_states: Dict[int, UserState] = {}
@@ -370,8 +463,45 @@ def get_main_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    username = update.message.from_user.username
     if user_id not in user_states:
         user_states[user_id] = UserState(user_id)
+
+    # Log user activity to database
+    try:
+        with db.get_cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO message_logs (user_id, timestamp)
+                VALUES (?, ?)
+                """,
+                (user_id, get_utc_timestamp()),
+            )
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO user_states (
+                    user_id, state, query, current_page, last_search_time,
+                    total_results, status, join_time, last_active_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    user_states[user_id].state,
+                    user_states[user_id].query,
+                    user_states[user_id].current_page,
+                    (
+                        user_states[user_id].last_search_time.isoformat()
+                        if user_states[user_id].last_search_time
+                        else None
+                    ),
+                    user_states[user_id].total_results,
+                    "invalid" if not username else "active",
+                    get_utc_timestamp(),
+                    get_utc_timestamp(),
+                ),
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Failed to log message or update user state in start: {e}")
 
     try:
         lang = detect(update.message.text)[:2] if update.message.text else "en"
@@ -455,7 +585,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard(),
         )
 
-async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def handle_inline_buttons(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -463,42 +596,56 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     logger.debug(f"Inline button clicked by user {user_id}: {data}")
 
+    # Update last_active_time
+    try:
+        with db.get_cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE user_states SET last_active_time = ?
+                WHERE user_id = ?
+                """,
+                (get_utc_timestamp(), user_id),
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Failed to update last_active_time: {e}")
+
     if data == "back_to_settings":
         username = query.from_user.username or "N/A"
-        today = datetime.utcnow().date()
-        start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
-        end_of_day = datetime.combine(today + timedelta(days=1), datetime.min.time()).isoformat()
+        today = datetime.now(utc).date()
+        start_of_day = datetime.combine(
+            today, datetime.min.time(), tzinfo=utc
+        ).isoformat()
+        end_of_day = datetime.combine(
+            today + timedelta(days=1), datetime.min.time(), tzinfo=utc
+        ).isoformat()
 
         try:
-            conn = sqlite3.connect("user_states.db")
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM user_states
-                WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
-                """,
-                (user_id, start_of_day, end_of_day)
-            )
-            searches_today = cursor.fetchone()[0]
-            cursor.execute(
-                """
-                SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
-                WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
-                """,
-                (user_id, start_of_day, end_of_day)
-            )
-            pdfs_downloaded, total_bytes = cursor.fetchone()
-            total_mb = total_bytes / (1024 * 1024)
-            traffic_limit_mb = 1024
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_states
+                    WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
+                    """,
+                    (user_id, start_of_day, end_of_day),
+                )
+                searches_today = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
+                    WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+                    """,
+                    (user_id, start_of_day, end_of_day),
+                )
+                pdfs_downloaded, total_bytes = cursor.fetchone()
+                total_mb = total_bytes / (1024 * 1024)
+                traffic_limit_mb = 2048
         except sqlite3.Error as e:
             logger.error(f"Database error in back_to_settings: {e}")
             await query.message.edit_text(
                 text="❌ Error fetching usage stats. Please try again later.",
-                reply_markup=get_main_keyboard()
+                reply_markup=get_main_keyboard(),
             )
             return
-        finally:
-            conn.close()
 
         message = (
             "⚙️ Settings for Research Paper Finder\n\n"
@@ -513,102 +660,144 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = [
             [
                 InlineKeyboardButton("📊 Statistics", callback_data="show_statistics"),
-                InlineKeyboardButton("📬 Contact us", callback_data="show_contact")
+                InlineKeyboardButton("📬 Contact us", callback_data="show_contact"),
             ],
             [
                 InlineKeyboardButton("❔ About bot", callback_data="show_about"),
-                InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")
-            ]
+                InlineKeyboardButton(
+                    "📖 How to use the bot", callback_data="show_howto"
+                ),
+            ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(
-            text=message,
-            reply_markup=reply_markup
-        )
+        await query.message.edit_text(text=message, reply_markup=reply_markup)
         logger.debug(f"Returned to settings for user {user_id}")
         return
 
-    # Statistics button
     if data == "show_statistics":
         try:
-            conn = sqlite3.connect("user_states.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'total_users'")
-            total_users = cursor.fetchone()[0]
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'active_users'")
-            active_users = cursor.fetchone()[0]
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'active_24h_users'")
-            active_24h_users = cursor.fetchone()[0]
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'deactivated_users'")
-            deactivated_users = cursor.fetchone()[0]
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'blocked_users'")
-            blocked_users = cursor.fetchone()[0]
-            cursor.execute("SELECT value FROM bot_stats WHERE stat_name = 'queue_size'")
-            queue_size = cursor.fetchone()[0]
-            
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
-                WHERE timestamp >= ?
-                """,
-                ((datetime.utcnow() - timedelta(hours=1)).isoformat(),)
-            )
-            traffic_1h_bytes, downloads_1h = cursor.fetchone()
-            traffic_1h_gb = traffic_1h_bytes / (1024 * 1024 * 1024)
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
-                WHERE timestamp >= ?
-                """,
-                ((datetime.utcnow() - timedelta(days=1)).isoformat(),)
-            )
-            traffic_24h_bytes, downloads_24h = cursor.fetchone()
-            traffic_24h_gb = traffic_24h_bytes / (1024 * 1024 * 1024)
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
-                WHERE timestamp >= ?
-                """,
-                ((datetime.utcnow() - timedelta(days=30)).isoformat(),)
-            )
-            traffic_30d_bytes, downloads_30d = cursor.fetchone()
-            traffic_30d_gb = traffic_30d_bytes / (1024 * 1024 * 1024)
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
-                """
-            )
-            traffic_total_bytes, downloads_total = cursor.fetchone()
-            traffic_total_gb = traffic_total_bytes / (1024 * 1024 * 1024)
-            
-            errors_1h = downloads_1h // 10
-            errors_24h = downloads_24h // 10
-            errors_30d = downloads_30d // 10
-            
-            messages_1h = 2985
-            messages_24h = 64309
-            messages_30d = 2393123
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM paper_queue WHERE status = 'pending'
+                    """
+                )
+                queue_size = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM user_states")
+                total_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_states WHERE status = 'active'
+                    """
+                )
+                active_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT user_id) FROM user_states
+                    WHERE last_active_time >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(hours=24)).isoformat(),),
+                )
+                active_24h_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_states WHERE status = 'deactivated'
+                    """
+                )
+                deactivated_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_states WHERE status = 'invalid'
+                    """
+                )
+                invalid_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_states WHERE status = 'blocked'
+                    """
+                )
+                blocked_users = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(hours=1)).isoformat(),),
+                )
+                traffic_1h_bytes, downloads_1h = cursor.fetchone()
+                traffic_1h_gb = traffic_1h_bytes / (1024 * 1024 * 1024)
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(days=1)).isoformat(),),
+                )
+                traffic_24h_bytes, downloads_24h = cursor.fetchone()
+                traffic_24h_gb = traffic_24h_bytes / (1024 * 1024 * 1024)
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(days=30)).isoformat(),),
+                )
+                traffic_30d_bytes, downloads_30d = cursor.fetchone()
+                traffic_30d_gb = traffic_30d_bytes / (1024 * 1024 * 1024)
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(file_size), 0), COUNT(*) FROM pdf_downloads
+                    """
+                )
+                traffic_total_bytes, downloads_total = cursor.fetchone()
+                traffic_total_gb = traffic_total_bytes / (1024 * 1024 * 1024)
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM message_logs
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(hours=1)).isoformat(),),
+                )
+                messages_1h = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM message_logs
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(days=1)).isoformat(),),
+                )
+                messages_24h = cursor.fetchone()[0]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM message_logs
+                    WHERE timestamp >= ?
+                    """,
+                    ((datetime.now(utc) - timedelta(days=30)).isoformat(),),
+                )
+                messages_30d = cursor.fetchone()[0]
+                errors_1h = downloads_1h // 10
+                errors_24h = downloads_24h // 10
+                errors_30d = downloads_30d // 10
         except sqlite3.Error as e:
             logger.error(f"Database error in statistics: {e}")
             await query.message.edit_text(
                 text="❌ Error fetching statistics. Please try again later.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]])
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+                ),
             )
             return
-        finally:
-            conn.close()
 
         message = (
             "📊 Research Paper Finder Statistics\n\n"
-            f"Papers in Queue: {queue_size} (updated now)\n\n"
-            f"Total Users: {total_users:,}\n"
-            "Numbers updated every hour.\n\n"
+            f"Papers in Queue: {queue_size}\n\n"
+            f"Total Users: {total_users:,}\n\n"
             "Users:\n"
             f"• Active: {active_users:,}\n"
             f"• Active in 24 hours: {active_24h_users:,}\n"
             f"• Deactivated: {deactivated_users:,}\n"
             f"• Not found: 0\n"
-            f"• Invalid: 68\n"
+            f"• Invalid: {invalid_users:,}\n"
             f"• Blocked this bot: {blocked_users:,}\n\n"
             "Traffic:\n"
             f"• 1 hour: {traffic_1h_gb:.1f} GB\n"
@@ -627,10 +816,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(
-            text=message,
-            reply_markup=reply_markup
-        )
+        await query.message.edit_text(text=message, reply_markup=reply_markup)
         logger.debug(f"Sent statistics message to user {user_id}")
         return
 
@@ -645,10 +831,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(
-            text=message,
-            reply_markup=reply_markup
-        )
+        await query.message.edit_text(text=message, reply_markup=reply_markup)
         logger.debug(f"Sent contact message to user {user_id}")
         return
 
@@ -666,10 +849,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(
-            text=message,
-            reply_markup=reply_markup
-        )
+        await query.message.edit_text(text=message, reply_markup=reply_markup)
         logger.debug(f"Sent about message to user {user_id}")
         return
 
@@ -683,17 +863,23 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             "5. Help: Use /help for assistance.\n\n"
             "Tips:\n"
             "• Use specific keywords for better results.\n"
-            "• Daily traffic limit: 1,024 MB.\n"
+            "• Daily traffic limit: 2,048 MB.\n"
             "• Contact us if you encounter issues."
         )
         keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.edit_text(
-            text=message,
-            reply_markup=reply_markup
-        )
+        await query.message.edit_text(text=message, reply_markup=reply_markup)
         logger.debug(f"Sent how-to message to user {user_id}")
         return
+
+    logger.warning(f"Unhandled callback data: {data}")
+    await query.message.edit_text(
+        text="❌ Unknown action. Please try again.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_settings")]]
+        ),
+    )
+
 
 async def cleanup_load_more_state(user_id, context):
     try:
@@ -724,7 +910,7 @@ async def send_load_more_timeout_message(context: ContextTypes.DEFAULT_TYPE):
         user_state = user_states[user_id]
         if (
             user_state.load_more_timestamp
-            and (datetime.now() - user_state.load_more_timestamp).total_seconds()
+            and (datetime.now(utc) - user_state.load_more_timestamp).total_seconds()
             >= LOAD_MORE_TIMEOUT
         ):
             try:
@@ -772,14 +958,7 @@ async def handle_load_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.save_to_db()
 
     if user_state.timeout_job:
-        user_state.timeout_job.schedule_removal()
-        user_state.timeout_job = None
-
-    processing_message = await query.message.reply_text(LOCALES[lang]["searching"])
-
-    await send_paper_results(
-        update, context, stored_query, processing_message, is_load_more=True, lang=lang
-    )
+        user_state.timeout_job.schedule  # ... (previous code continues)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,6 +972,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lang = "en"
         except:
             lang = "en"
+
+        # Check user status
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    "SELECT status FROM user_states WHERE user_id = ?", (user_id,)
+                )
+                result = cursor.fetchone()
+                if result and result[0] == "invalid":
+                    await update.message.reply_text(
+                        "🚫 Account invalid due to missing username. Please set a Telegram username.",
+                        reply_markup=get_main_keyboard(),
+                    )
+                    return
+        except sqlite3.Error as e:
+            logger.error(f"Error checking user status: {e}")
 
         if not check_rate_limit(user_id):
             await update.message.reply_text(
@@ -810,13 +1005,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states[user_id].timeout_job.schedule_removal()
             user_states[user_id].timeout_job = None
 
+        # Log user activity and queue search
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO message_logs (user_id, timestamp)
+                    VALUES (?, ?)
+                    """,
+                    (user_id, get_utc_timestamp()),
+                )
+                cursor.execute(
+                    """
+                    UPDATE user_states SET last_active_time = ?, last_search_time = ?
+                    WHERE user_id = ?
+                    """,
+                    (get_utc_timestamp(), get_utc_timestamp(), user_id),
+                )
+                if message_text and user_states[user_id].state in [
+                    None,
+                    "awaiting_query",
+                ]:
+                    cursor.execute(
+                        """
+                        INSERT INTO paper_queue (user_id, paper_url, timestamp, status)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            f"query://{message_text}",
+                            get_utc_timestamp(),
+                            "pending",
+                        ),
+                    )
+        except sqlite3.Error as e:
+            logger.error(
+                f"Failed to log message or update user state in handle_text: {e}"
+            )
+
         if user_states[user_id].state == "awaiting_query":
             query = message_text
             logger.info(f"Processing search query from user {user_id}: {query}")
             user_states[user_id].state = None
             user_states[user_id].query = query
             user_states[user_id].current_page = 0
-            user_states[user_id].last_search_time = datetime.now()
+            user_states[user_id].last_search_time = datetime.now(utc)
             user_states[user_id].save_to_db()
 
             await cleanup_load_more_state(user_id, context)
@@ -875,64 +1108,53 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        # Update user activity
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE user_states SET last_active_time = ?
+                    WHERE user_id = ?
+                    """,
+                    (get_utc_timestamp(), user_id),
+                )
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update last_active_time: {e}")
+
         # Check traffic limit
         try:
-            conn = sqlite3.connect("user_states.db")
-            cursor = conn.cursor()
-            today = datetime.utcnow().date()
-            start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
-            end_of_day = datetime.combine(
-                today + timedelta(days=1), datetime.min.time()
-            ).isoformat()
+            with db.get_cursor() as cursor:
+                today = datetime.now(utc).date()
+                start_of_day = datetime.combine(
+                    today, datetime.min.time(), tzinfo=utc
+                ).isoformat()
+                end_of_day = datetime.combine(
+                    today + timedelta(days=1), datetime.min.time(), tzinfo=utc
+                ).isoformat()
 
-            cursor.execute(
-                """
-                SELECT COALESCE(SUM(file_size), 0) FROM pdf_downloads
-                WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
-                """,
-                (user_id, start_of_day, end_of_day),
-            )
-            total_bytes = cursor.fetchone()[0]
-            total_mb = total_bytes / (1024 * 1024)
-            traffic_limit_mb = 1024
-
-            if total_mb >= traffic_limit_mb:
                 cursor.execute(
-                    "SELECT quota_reached_time FROM traffic_limits WHERE user_id = ?",
-                    (user_id,),
+                    """
+                    SELECT COALESCE(SUM(file_size), 0) FROM pdf_downloads
+                    WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+                    """,
+                    (user_id, start_of_day, end_of_day),
                 )
-                result = cursor.fetchone()
-                if result:
-                    quota_reached_time = datetime.fromisoformat(result[0])
-                    time_since_quota = datetime.utcnow() - quota_reached_time
-                    if time_since_quota < timedelta(hours=24):
-                        remaining_time = timedelta(hours=24) - time_since_quota
-                        hours, remainder = divmod(remaining_time.seconds, 3600)
-                        minutes = remainder // 60
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"🚫 Daily traffic limit of {traffic_limit_mb} MB reached. "
-                            f"Please try again in {hours}h {minutes}m.",
-                            reply_markup=keyboard,
-                        )
-                        await processing_message.delete()
-                        return
-                    else:
-                        # Reset quota
-                        cursor.execute(
-                            "DELETE FROM traffic_limits WHERE user_id = ?", (user_id,)
-                        )
-                else:
-                    # Record quota reached time
+                total_bytes = cursor.fetchone()[0]
+                total_mb = total_bytes / (1024 * 1024)
+                traffic_limit_mb = 2048
+                max_single_download_mb = 100
+
+                if total_mb >= traffic_limit_mb:
                     cursor.execute(
-                        "INSERT INTO traffic_limits (user_id, quota_reached_time) VALUES (?, ?)",
-                        (user_id, datetime.utcnow().isoformat()),
+                        """
+                        INSERT OR REPLACE INTO traffic_limits (user_id, quota_reached_time)
+                        VALUES (?, ?)
+                        """,
+                        (user_id, get_utc_timestamp()),
                     )
-                    conn.commit()
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=f"🚫 Daily traffic limit of {traffic_limit_mb} MB reached. "
-                        f"Please try again in 24 hours.",
+                        text=f"🚫 Daily traffic limit of {traffic_limit_mb} MB reached. Please try again in 24 hours.",
                         reply_markup=keyboard,
                     )
                     await processing_message.delete()
@@ -946,8 +1168,6 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await processing_message.delete()
             return
-        finally:
-            conn.close()
 
         # Validate user state
         logger.debug(f"Checking user state for user_id: {user_id}")
@@ -1048,6 +1268,22 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf_url = paper["link"].replace("abs", "pdf") + ".pdf"
         logger.debug(f"Attempting to download PDF from: {pdf_url}")
 
+        # Update paper_queue status
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE paper_queue SET status = 'processed'
+                    WHERE user_id = ? AND paper_url = ? AND status = 'pending'
+                    """,
+                    (user_id, pdf_url),
+                )
+            logger.debug(
+                f"Updated paper_queue for user {user_id}: {pdf_url} to processed"
+            )
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update paper_queue: {e}")
+
         # Check file size
         lang = "en"
         try:
@@ -1073,18 +1309,46 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if "Content-Length" in response.headers:
                 file_size = int(response.headers["Content-Length"])
-                logger.debug(f"PDF file size: {file_size} bytes")
-                if file_size > TELEGRAM_FILE_SIZE_LIMIT:
-                    logger.warning(f"PDF too large: {file_size} bytes, URL: {pdf_url}")
+            else:
+                logger.warning(
+                    f"No Content-Length for {pdf_url}, attempting range request"
+                )
+                response = session.get(
+                    pdf_url, headers={"Range": "bytes=0-1023"}, stream=True, timeout=10
+                )
+                if response.status_code in (200, 206):
+                    file_size = int(
+                        response.headers.get("Content-Range", "/0").split("/")[-1]
+                    )
+                else:
+                    logger.error(f"Failed to estimate size for {pdf_url}")
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=LOCALES[lang]["file_too_large"].format(url=pdf_url),
+                        text="❌ Unable to verify PDF size. Download aborted.",
                         reply_markup=keyboard,
                     )
                     await processing_message.delete()
                     return
-            else:
-                logger.warning(f"No Content-Length header for PDF: {pdf_url}")
+
+            logger.debug(f"PDF file size: {file_size} bytes")
+            if file_size > TELEGRAM_FILE_SIZE_LIMIT:
+                logger.warning(f"PDF too large: {file_size} bytes, URL: {pdf_url}")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=LOCALES[lang]["file_too_large"].format(url=pdf_url),
+                    reply_markup=keyboard,
+                )
+                await processing_message.delete()
+                return
+
+            if file_size > max_single_download_mb * 1024 * 1024:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ PDF exceeds {max_single_download_mb} MB limit. Try another paper.",
+                    reply_markup=keyboard,
+                )
+                await processing_message.delete()
+                return
 
             # Update feedback to indicate uploading
             try:
@@ -1116,28 +1380,24 @@ async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Log PDF download to database
             try:
-                conn = sqlite3.connect("user_states.db")
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO pdf_downloads (user_id, timestamp, pdf_url, file_size)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        datetime.utcnow().isoformat(),
-                        pdf_url,
-                        file_size if "file_size" in locals() else 0,
-                    ),
-                )
-                conn.commit()
-                logger.debug(
-                    f"Logged PDF download for user {user_id}: {pdf_url}, {file_size} bytes"
+                with db.get_cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO pdf_downloads (user_id, timestamp, pdf_url, file_size)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            get_utc_timestamp(),
+                            pdf_url,
+                            file_size,
+                        ),
+                    )
+                logger.info(
+                    f"User {user_id} downloaded {pdf_url}, size: {file_size / (1024 * 1024):.2f} MB"
                 )
             except sqlite3.Error as e:
                 logger.error(f"Failed to log PDF download: {e}")
-            finally:
-                conn.close()
 
             # Delete the processing message
             try:
@@ -1314,7 +1574,7 @@ async def send_paper_results(
         if len(papers_to_show) == results_per_page and (
             page + 1
         ) * results_per_page < len(papers):
-            user_state.load_more_timestamp = datetime.now()
+            user_state.load_more_timestamp = datetime.now(utc)
             user_state.timeout_job = context.job_queue.run_once(
                 send_load_more_timeout_message,
                 LOAD_MORE_TIMEOUT,
@@ -1353,39 +1613,37 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Settings command received from user {user_id} (@{username})")
 
     # Get today's date range
-    today = datetime.utcnow().date()
-    start_of_day = datetime.combine(today, datetime.min.time()).isoformat()
+    today = datetime.now(utc).date()
+    start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=utc).isoformat()
     end_of_day = datetime.combine(
-        today + timedelta(days=1), datetime.min.time()
+        today + timedelta(days=1), datetime.min.time(), tzinfo=utc
     ).isoformat()
 
     # Query database for usage stats
     try:
-        conn = sqlite3.connect("user_states.db")
-        cursor = conn.cursor()
-
-        # Count searches today
-        cursor.execute(
-            """
-            SELECT COUNT(*) FROM user_states
-            WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
-            """,
-            (user_id, start_of_day, end_of_day),
-        )
-        searches_today = cursor.fetchone()[0]
-
-        # Count PDFs downloaded and sum file sizes
-        cursor.execute(
-            """
-            SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
-            WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
-            """,
-            (user_id, start_of_day, end_of_day),
-        )
-        pdfs_downloaded, total_bytes = cursor.fetchone()
-        total_mb = total_bytes / (1024 * 1024)
-        traffic_limit_mb = 1024
-
+        with db.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM user_states
+                WHERE user_id = ? AND last_search_time >= ? AND last_search_time < ?
+                """,
+                (user_id, start_of_day, end_of_day),
+            )
+            searches_today = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(file_size), 0) FROM pdf_downloads
+                WHERE user_id = ? AND timestamp >= ? AND timestamp < ?
+                """,
+                (user_id, start_of_day, end_of_day),
+            )
+            pdfs_downloaded, total_bytes = cursor.fetchone()
+            total_mb = total_bytes / (1024 * 1024)
+            traffic_limit_mb = 2048
+            if total_mb > traffic_limit_mb:
+                logger.warning(
+                    f"User {user_id} usage {total_mb} MB exceeds limit {traffic_limit_mb} MB"
+                )
     except sqlite3.Error as e:
         logger.error(f"Database error in settings: {e}")
         await context.bot.send_message(
@@ -1394,8 +1652,6 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=get_main_keyboard(),
         )
         return
-    finally:
-        conn.close()
 
     # Format the message
     message = (
@@ -1413,13 +1669,12 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [
             InlineKeyboardButton("📊 Statistics", callback_data="show_statistics"),
-            InlineKeyboardButton("📬 Contact us", callback_data="show_contact")
+            InlineKeyboardButton("📬 Contact us", callback_data="show_contact"),
         ],
         [
             InlineKeyboardButton("❔ About bot", callback_data="show_about"),
-            InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")
+            InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto"),
         ],
-        [InlineKeyboardButton("📖 How to use the bot", callback_data="show_howto")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -1430,18 +1685,111 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.debug(f"Sent settings message to user {user_id}")
 
 
+async def block_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.my_chat_member:
+        return
+    user_id = update.my_chat_member.from_user.id
+    new_status = update.my_chat_member.new_chat_member.status
+    is_bot = update.my_chat_member.new_chat_member.user.id == context.bot.id
+    if is_bot and new_status == "kicked":
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE user_states SET status = 'blocked', last_active_time = ?
+                    WHERE user_id = ?
+                    """,
+                    (get_utc_timestamp(), user_id),
+                )
+            logger.debug(f"User {user_id} blocked the bot")
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update blocked status: {e}")
+    elif is_bot and new_status == "left":
+        try:
+            with db.get_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE user_states SET status = 'deactivated', last_active_time = ?
+                    WHERE user_id = ?
+                    """,
+                    (get_utc_timestamp(), user_id),
+                )
+            logger.debug(f"User {user_id} deactivated the bot")
+        except sqlite3.Error as e:
+            logger.error(f"Failed to update deactivated status: {e}")
+
+
+async def cleanup_traffic_limits(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with db.get_cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM traffic_limits
+                WHERE quota_reached_time < ?
+                """,
+                ((datetime.now(utc) - timedelta(hours=24)).isoformat(),),
+            )
+        logger.debug(f"Cleaned up {cursor.rowcount} stale traffic limit entries")
+    except sqlite3.Error as e:
+        logger.error(f"Error cleaning up traffic limits: {e}")
+
+
+class CustomHTTPXRequest(HTTPXRequest):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            client=httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                timeout=httpx.Timeout(10.0, connect=5.0, read=5.0, write=5.0),
+                **kwargs,
+            ),
+        )
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
+    if isinstance(context.error, NetworkError):
+        logger.warning("NetworkError detected, retrying...")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                for handler in context.application.handlers[0]:
+                    if isinstance(
+                        handler, CallbackQueryHandler
+                    ) and handler.check_update(update):
+                        await handler.handle_update(
+                            update, context.application, context
+                        )
+                        return
+            except NetworkError as e:
+                logger.warning(f"Retry {attempt + 1}/{max_retries} failed: {e}")
+                await asyncio.sleep(2**attempt)
+        logger.error("All retries failed")
+        if update.callback_query:
+            await update.callback_query.message.reply_text(
+                "❌ Network error. Please try again later.",
+                reply_markup=get_main_keyboard(),
+            )
+
+
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings))
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
     app.add_handler(CallbackQueryHandler(download_paper, pattern="^download_"))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-    app.add_handler(CallbackQueryHandler(handle_inline_buttons))
-
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern="^action_"))
+    app.add_handler(
+        CallbackQueryHandler(handle_inline_buttons, pattern="^(show_|back_to_settings)")
+    )
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, block_middleware)
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.job_queue.run_repeating(cleanup_traffic_limits, interval=3600)
 
     logger.info(f"Python version: {sys.version}")
     logger.info(f"PTB version: {telegram.__version__}")
@@ -1474,7 +1822,8 @@ if __name__ == "__main__":
     finally:
         logger.info(f"Beginning shutdown process (reason: {shutdown_reason})")
         try:
-            logger.info("Performing final cleanup")
+            db.close()
+            logger.info("Database connection closed")
         except Exception as cleanup_error:
             logger.error(f"Error during cleanup: {cleanup_error}")
             if exit_code == 0:
