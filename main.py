@@ -473,43 +473,6 @@ async def handle_load_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_paper_results(
         update, context, stored_query, processing_message, is_load_more=True, lang=lang
     )
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-    message_id = query.message.message_id
-
-    try:
-        lang = "en"  # Default to English for callback queries
-    except:
-        lang = "en"
-
-    if (
-        user_id not in user_states
-        or not user_states[user_id].query
-        or not user_states[user_id].load_more_message_id
-        or user_states[user_id].load_more_message_id != message_id
-    ):
-        await query.message.reply_text(
-            LOCALES[lang]["session_expired"], reply_markup=get_main_keyboard()
-        )
-        return
-
-    user_state = user_states[user_id]
-    stored_query = user_state.query
-    user_state.current_page += 1
-    user_state.save_to_db()
-
-    if user_state.timeout_job:
-        user_state.timeout_job.schedule_removal()
-        user_state.timeout_job = None
-
-    processing_message = await query.message.reply_text(LOCALES[lang]["searching"])
-
-    await send_paper_results(
-        update, context, stored_query, processing_message, is_load_more=True, lang=lang
-    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,6 +545,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             LOCALES[lang]["error"],
             reply_markup=get_main_keyboard(),
+        )
+
+
+# Add logging to debug callback query handling
+async def download_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+    data = query.data
+
+    logger.info(f"Download button clicked. Callback data: {data}")  # Debug log
+
+    if user_id not in user_states or not user_states[user_id].query:
+        await query.message.reply_text(
+            "Your session has expired. Please start a new search.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    try:
+        paper_index = int(data.split("_")[-1])  # Extract paper index from callback data
+    except ValueError:
+        logger.error(f"Invalid callback data format: {data}")
+        await query.message.reply_text(
+            "Invalid request. Please try again.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    user_state = user_states[user_id]
+    query_text = user_state.query
+
+    # Fetch papers again to ensure we have the latest data
+    result = search_arxiv(
+        query_text, max_results=50
+    )  # Fetch more results to cover all indices
+
+    if isinstance(result, dict) and "error" in result:
+        error_msg = result.get("message", "An unknown error occurred.")
+        logger.error(f"Error fetching papers: {error_msg}")
+        await query.message.reply_text(
+            f"❌ {error_msg}", reply_markup=get_main_keyboard()
+        )
+        return
+
+    papers = result
+    if paper_index >= len(papers):
+        logger.warning(
+            f"Paper index {paper_index} out of range. Total papers: {len(papers)}"
+        )
+        await query.message.reply_text(
+            "No paper found at the specified index.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    paper = papers[paper_index]
+    pdf_url = paper["link"].replace(
+        "abs", "pdf"
+    )  # Convert arXiv abstract URL to PDF URL
+
+    try:
+        logger.info(f"Sending PDF: {pdf_url}")
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=pdf_url,
+            filename=f"{paper['title']}.pdf",
+            caption=f"📄 {paper['title']}\n\n🔗 [Read more]({paper['link']})",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Error sending PDF: {e}")
+        await query.message.reply_text(
+            "An error occurred while sending the PDF.", reply_markup=get_main_keyboard()
         )
 
 
@@ -667,6 +704,15 @@ async def send_paper_results(
                     f"🔗 [Read more]({paper['link']})"
                 )
 
+                # Add "Download PDF" button for each paper
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            "📄 Download PDF", callback_data=f"download_{i}"
+                        )
+                    ]
+                ]
+
                 # Add "Load More" button on the last paper if more results exist
                 if i == len(papers_to_show) - 1:
                     next_index = results_per_page * (page + 1)
@@ -676,43 +722,19 @@ async def send_paper_results(
                     )
 
                     if has_more:
-                        keyboard = [
+                        keyboard.append(
                             [
                                 InlineKeyboardButton(
                                     "📚 Load More Results", callback_data="load_more"
                                 )
                             ]
-                        ]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-
-                        last_message = await update.effective_message.reply_markdown(
-                            msg, reply_markup=reply_markup
                         )
 
-                        user_state.load_more_timestamp = datetime.now()
-                        user_state.load_more_message_id = last_message.message_id
-                        user_state.save_to_db()
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
-                        if user_state.timeout_job:
-                            user_state.timeout_job.schedule_removal()
-
-                        chat_id = update.effective_chat.id
-                        job_data = {"user_id": user_id, "chat_id": chat_id}
-
-                        user_state.timeout_job = context.job_queue.run_once(
-                            send_load_more_timeout_message,
-                            LOAD_MORE_TIMEOUT,
-                            data=job_data,
-                        )
-                        logger.info(
-                            f"Scheduled load_more timeout for user {user_id} in {LOAD_MORE_TIMEOUT} seconds"
-                        )
-                    else:
-                        await update.effective_message.reply_markdown(
-                            msg, reply_markup=get_main_keyboard()
-                        )
-                else:
-                    await update.effective_message.reply_markdown(msg)
+                await update.effective_message.reply_markdown(
+                    msg, reply_markup=reply_markup
+                )
             except Exception as e:
                 logger.error(f"Error sending paper {i+1}: {e}")
                 continue
@@ -747,6 +769,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(handle_load_more, pattern="^load_more$"))
     app.add_handler(CallbackQueryHandler(handle_buttons))
+    app.add_handler(CallbackQueryHandler(download_paper, pattern="^download_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info(f"Python version: {sys.version}")
